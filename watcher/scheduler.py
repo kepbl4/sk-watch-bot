@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import unicodedata
@@ -172,16 +173,20 @@ class WatcherScheduler:
         url = (category or {}).get("url") or os.getenv("LOGIN_URL", "")
         page = await context.new_page()
         try:
-            await page.goto(url, wait_until="networkidle", timeout=60000)
+            response = await page.goto(url, wait_until="networkidle", timeout=60000)
+            http_status = response.status if response else None
+            page_url = page.url
             await self._wait_for_schedule(page)
             entries = await self._parse_city_rows(page)
-            for name, date_str in entries:
+            raw_map: Dict[str, str] = {}
+            for name, date_str, raw_text in entries:
                 slug = _slugify_city(name)
                 city_key = reverse_slug.get(slug)
                 if not city_key:
                     logger.warning("Unknown city slug %s (%s)", slug, name)
                     continue
                 updates[city_key] = ("OK" if date_str else "NO_DATE", date_str)
+                raw_map[city_key] = raw_text
 
             for city_key, watch in city_map.items():
                 status, date_str = updates.get(city_key, ("NO_DATE", None))
@@ -209,6 +214,20 @@ class WatcherScheduler:
                         )
 
             await asyncio.to_thread(db.set_category_status, cat_key, "OK", last_error=None)
+            await self._record_diagnostics(
+                cat_key,
+                city_map,
+                page_url,
+                updates,
+                raw_map,
+                http_status,
+                default_comment="",
+            )
+            await auth_manager.capture_page_screenshot(
+                page,
+                prefix=f"CategoryCheck_{cat_key}",
+                description=f"Проверка категории {cat_key}",
+            )
             await asyncio.to_thread(db.settings_set, "auth_state", "OK")
             await self._finalise_run(run_id, "OK", new_findings)
             return "OK", new_findings
@@ -221,6 +240,15 @@ class WatcherScheduler:
                 last_error="timeout",
             )
             await asyncio.to_thread(db.reset_watches_for_category, cat_key, "ERROR", "timeout")
+            await self._record_diagnostics(
+                cat_key,
+                city_map,
+                url,
+                {key: ("ERROR", None) for key in city_map},
+                {},
+                None,
+                default_comment="timeout",
+            )
             await self._finalise_run(run_id, "ERROR", new_findings)
             return "ERROR", new_findings
         except Exception as exc:  # pragma: no cover - network issues
@@ -232,6 +260,15 @@ class WatcherScheduler:
                 last_error=str(exc),
             )
             await asyncio.to_thread(db.reset_watches_for_category, cat_key, "ERROR", str(exc))
+            await self._record_diagnostics(
+                cat_key,
+                city_map,
+                url,
+                {key: ("ERROR", None) for key in city_map},
+                {},
+                None,
+                default_comment=str(exc),
+            )
             await self._finalise_run(run_id, "ERROR", new_findings)
             return "ERROR", new_findings
         finally:
@@ -247,8 +284,8 @@ class WatcherScheduler:
     async def _wait_for_schedule(self, page: Page) -> None:
         await page.wait_for_selector("text=Pracoviská", timeout=30000)
 
-    async def _parse_city_rows(self, page: Page) -> List[Tuple[str, Optional[str]]]:
-        results: List[Tuple[str, Optional[str]]] = []
+    async def _parse_city_rows(self, page: Page) -> List[Tuple[str, Optional[str], str]]:
+        results: List[Tuple[str, Optional[str], str]] = []
         labels = await page.locator("label").all_text_contents()
         pattern = re.compile(r"^OCP\s+(.+?)(?:\s*[–-]\s*(\d{1,2}\.\d{1,2}\.\d{4}))?$")
         for raw in labels:
@@ -263,8 +300,48 @@ class WatcherScheduler:
                 iso_value = f"{year}-{int(month):02d}-{int(day):02d}"
             else:
                 iso_value = None
-            results.append((city_name, iso_value))
+            results.append((city_name, iso_value, text))
         return results
+
+    async def _record_diagnostics(
+        self,
+        cat_key: str,
+        city_map: Dict[str, Dict[str, str]],
+        page_url: str,
+        updates: Dict[str, Tuple[str, Optional[str]]],
+        raw_map: Dict[str, str],
+        http_status: Optional[int],
+        *,
+        default_comment: str,
+    ) -> None:
+        now_iso = datetime.utcnow().isoformat()
+        for city_key, watch in city_map.items():
+            status, date_str = updates.get(city_key, ("NO_DATE", None))
+            anchor_text = raw_map.get(city_key, "")
+            anchor_hash = hashlib.sha1(anchor_text.encode("utf-8")).hexdigest()
+            comment = date_str or default_comment or status
+            previous = await asyncio.to_thread(db.get_last_diagnostic, cat_key, city_key)
+            prev_len = int(previous.get("content_len") or 0) if previous else 0
+            diff_len = len(anchor_text) - prev_len
+            if not previous:
+                diff_anchor = "new"
+            else:
+                prev_hash = previous.get("anchor_hash") or ""
+                diff_anchor = "changed" if prev_hash != anchor_hash else "same"
+            await asyncio.to_thread(
+                db.record_diagnostic,
+                recorded_at=now_iso,
+                category_code=cat_key,
+                city_key=city_key,
+                url=page_url,
+                status=status,
+                http_status=http_status,
+                content_len=len(anchor_text),
+                anchor_hash=anchor_hash,
+                diff_len=diff_len,
+                diff_anchor=diff_anchor,
+                comment=comment,
+            )
 
     async def _send_notifications(self) -> int:
         pending = await asyncio.to_thread(db.get_pending_findings)
