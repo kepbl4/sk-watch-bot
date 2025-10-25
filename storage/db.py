@@ -14,27 +14,27 @@ _CONNECTION: Optional[sqlite3.Connection] = None
 _INITIALISED = False
 
 DEFAULT_CATEGORIES: Tuple[Tuple[str, str], ...] = (
-    ("UTOCISKO_REG", "Уточиско — регистрация"),
-    ("UTOCISKO_DOKLAD", "Уточиско — документы"),
-    ("PRECHODNY", "ВНЖ (временный)"),
-    ("TRVALY_5Y", "ПМЖ на 5 лет"),
-    ("TRVALY_UNLIM", "ПМЖ без срока"),
+    ("UTOCISKO_REG", "Útočisko — registrácia"),
+    ("UTOCISKO_DOKLAD", "Útočisko — doklady"),
+    ("PRECHODNY", "Prechodný pobyt"),
+    ("TRVALY_5Y", "Trvalý pobyt na 5 rokov"),
+    ("TRVALY_UNLIM", "Trvalý pobyt bez obmedzenia"),
 )
 
 DEFAULT_CITIES: Tuple[Tuple[str, str], ...] = (
-    ("banska_bystrica", "Банска-Бистрица"),
-    ("bratislava", "Братислава"),
-    ("dunajska_streda", "Дунайска-Стреда"),
-    ("kosice", "Кошице"),
-    ("michalovce", "Михаловце"),
-    ("nitra", "Нитра"),
-    ("nove_zamky", "Нове-Замки"),
-    ("presov", "Прешов"),
-    ("rimavska_sobota", "Римавска-Собота"),
-    ("ruzomberok", "Ружомберок"),
-    ("trencin", "Тренчин"),
-    ("trnava", "Трнава"),
-    ("zilina", "Жилина"),
+    ("banska_bystrica", "Banská Bystrica"),
+    ("bratislava", "Bratislava"),
+    ("dunajska_streda", "Dunajská Streda"),
+    ("kosice", "Košice"),
+    ("michalovce", "Michalovce"),
+    ("nitra", "Nitra"),
+    ("nove_zamky", "Nové Zámky"),
+    ("presov", "Prešov"),
+    ("rimavska_sobota", "Rimavská Sobota"),
+    ("ruzomberok", "Ružomberok"),
+    ("trencin", "Trenčín"),
+    ("trnava", "Trnava"),
+    ("zilina", "Žilina"),
 )
 
 
@@ -151,6 +151,46 @@ def init_db() -> None:
                 chat_id INTEGER,
                 message_id INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS diagnostics (
+                id INTEGER PRIMARY KEY,
+                recorded_at TEXT,
+                category_code TEXT,
+                city_key TEXT,
+                url TEXT,
+                status TEXT,
+                http_status INTEGER,
+                content_len INTEGER,
+                anchor_hash TEXT,
+                diff_len INTEGER,
+                diff_anchor TEXT,
+                comment TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS portal_pulses (
+                id INTEGER PRIMARY KEY,
+                recorded_at TEXT,
+                status TEXT,
+                latency_ms INTEGER,
+                http_status INTEGER,
+                error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS screenshots (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                path TEXT,
+                description TEXT,
+                created_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS pulses (
+                id INTEGER PRIMARY KEY,
+                created_at TEXT,
+                kind TEXT,
+                status TEXT,
+                note TEXT
+            );
             """
         )
 
@@ -161,11 +201,18 @@ def init_db() -> None:
 def _seed(conn: sqlite3.Connection) -> None:
     category_count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
     if category_count == 0:
-        for order, (key, title) in enumerate(DEFAULT_CATEGORIES, start=1):
+        for key, title in DEFAULT_CATEGORIES:
             conn.execute(
                 "INSERT INTO categories(key, title, url, enabled, status, last_check_at, last_error) "
                 "VALUES (?, ?, '', 0, 'PAUSED', NULL, NULL)",
                 (key, title),
+            )
+    else:
+        desired_titles = dict(DEFAULT_CATEGORIES)
+        for key, title in desired_titles.items():
+            conn.execute(
+                "UPDATE categories SET title = ? WHERE key = ? AND title != ?",
+                (title, key, title),
             )
 
     city_count = conn.execute("SELECT COUNT(*) FROM cities").fetchone()[0]
@@ -174,6 +221,13 @@ def _seed(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT INTO cities(key, title, ord) VALUES (?, ?, ?)",
                 (key, title, order),
+            )
+    else:
+        desired_cities = dict(DEFAULT_CITIES)
+        for key, title in desired_cities.items():
+            conn.execute(
+                "UPDATE cities SET title = ? WHERE key = ? AND title != ?",
+                (title, key, title),
             )
 
     # Ensure watches exist for each combination.
@@ -441,6 +495,155 @@ def mark_finding_notified(finding_id: int, when_iso: Optional[str] = None) -> No
         )
 
 
+def record_diagnostic(
+    *,
+    recorded_at: Optional[str],
+    category_code: str,
+    city_key: str,
+    url: str,
+    status: str,
+    http_status: Optional[int],
+    content_len: int,
+    anchor_hash: str,
+    diff_len: int,
+    diff_anchor: str,
+    comment: str,
+) -> None:
+    timestamp = recorded_at or datetime.utcnow().isoformat()
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO diagnostics(
+                recorded_at, category_code, city_key, url, status, http_status,
+                content_len, anchor_hash, diff_len, diff_anchor, comment
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp,
+                category_code,
+                city_key,
+                url,
+                status,
+                http_status,
+                content_len,
+                anchor_hash,
+                diff_len,
+                diff_anchor,
+                comment,
+            ),
+        )
+
+
+def get_last_diagnostic(category_code: str, city_key: str) -> Optional[Dict[str, Any]]:
+    with _cursor() as cur:
+        row = cur.execute(
+            """
+            SELECT * FROM diagnostics
+            WHERE category_code = ? AND city_key = ?
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT 1
+            """,
+            (category_code, city_key),
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_latest_diagnostics(limit: int = 100) -> List[Dict[str, Any]]:
+    query = """
+        SELECT d.*
+        FROM diagnostics d
+        INNER JOIN (
+            SELECT category_code, city_key, MAX(recorded_at) AS recorded_at
+            FROM diagnostics
+            GROUP BY category_code, city_key
+        ) latest
+        ON latest.category_code = d.category_code
+        AND latest.city_key = d.city_key
+        AND latest.recorded_at = d.recorded_at
+        ORDER BY d.recorded_at DESC
+        LIMIT ?
+    """
+    with _cursor() as cur:
+        rows = cur.execute(query, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def record_portal_pulse(
+    *,
+    recorded_at: Optional[str],
+    status: str,
+    latency_ms: Optional[int],
+    http_status: Optional[int],
+    error: Optional[str],
+) -> None:
+    timestamp = recorded_at or datetime.utcnow().isoformat()
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO portal_pulses(recorded_at, status, latency_ms, http_status, error)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (timestamp, status, latency_ms, http_status, error),
+        )
+
+
+def get_recent_portal_pulses(limit: int = 10) -> List[Dict[str, Any]]:
+    with _cursor() as cur:
+        rows = cur.execute(
+            "SELECT * FROM portal_pulses ORDER BY recorded_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def record_screenshot(name: str, path: str, description: str, *, created_at: Optional[str] = None) -> None:
+    timestamp = created_at or datetime.utcnow().isoformat()
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO screenshots(name, path, description, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (name, path, description, timestamp),
+        )
+
+
+def get_recent_screenshots(limit: int = 5) -> List[Dict[str, Any]]:
+    with _cursor() as cur:
+        rows = cur.execute(
+            "SELECT * FROM screenshots ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_screenshot(name: str) -> Optional[Dict[str, Any]]:
+    with _cursor() as cur:
+        row = cur.execute(
+            "SELECT * FROM screenshots WHERE name = ? ORDER BY created_at DESC LIMIT 1",
+            (name,),
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def record_pulse(kind: str, status: str, note: str, *, created_at: Optional[str] = None) -> None:
+    timestamp = created_at or datetime.utcnow().isoformat()
+    with _cursor() as cur:
+        cur.execute(
+            "INSERT INTO pulses(created_at, kind, status, note) VALUES (?, ?, ?, ?)",
+            (timestamp, kind, status, note),
+        )
+
+
+def get_recent_pulses(limit: int = 10) -> List[Dict[str, Any]]:
+    with _cursor() as cur:
+        rows = cur.execute(
+            "SELECT * FROM pulses ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def save_anchor(name: str, chat_id: int, message_id: int) -> None:
     with _cursor() as cur:
         cur.execute(
@@ -559,4 +762,14 @@ __all__ = [
     "list_tracked_watches",
     "create_run",
     "finish_run",
+    "record_diagnostic",
+    "get_last_diagnostic",
+    "get_latest_diagnostics",
+    "record_portal_pulse",
+    "get_recent_portal_pulses",
+    "record_screenshot",
+    "get_recent_screenshots",
+    "get_screenshot",
+    "record_pulse",
+    "get_recent_pulses",
 ]
