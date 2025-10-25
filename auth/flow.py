@@ -672,6 +672,130 @@ class AuthManager:
         return str(path)
 
 
+    async def _run_system_checks(self) -> None:
+        warnings = []
+        hint_parts = []
+        timedatectl_path = shutil.which("timedatectl")
+        if not timedatectl_path:
+            warnings.append("нет timedatectl")
+        else:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    timedatectl_path,
+                    "status",
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                if proc.returncode != 0:
+                    warnings.append("timedatectl вернул ошибку")
+                    hint_parts.append(f"rc={proc.returncode}")
+            except Exception as exc:  # pragma: no cover - system specific
+                warnings.append("timedatectl не отвечает")
+                hint_parts.append(str(exc))
+
+        if not Path("/etc/ssl/certs/ca-certificates.crt").exists():
+            warnings.append("нет ca-certificates")
+            hint_parts.append("apt install ca-certificates")
+
+        if not Path("/usr/share/zoneinfo").exists():
+            warnings.append("нет tzdata")
+            hint_parts.append("apt install tzdata")
+
+        if warnings:
+            message = "; ".join(warnings)
+            if hint_parts:
+                message = f"{message} ({'; '.join(hint_parts)})"
+            db.settings_set("auth_system_state", "WARN")
+            db.settings_set("auth_system_hint", message)
+        else:
+            db.settings_set("auth_system_state", "OK")
+            db.settings_set("auth_system_hint", "")
+
+    def _build_manual_link(self) -> str:
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        parts = urlsplit(self._login_url)
+        try:
+            from urllib.parse import parse_qsl
+
+            query = dict(parse_qsl(parts.query))
+        except Exception:
+            query = {}
+        query["manual_token"] = timestamp
+        new_query = urlencode(query)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+    async def capture_page_screenshot(
+        self,
+        page: Page,
+        *,
+        prefix: str,
+        description: str,
+    ) -> Optional[str]:
+        try:
+            data = await page.screenshot(full_page=True)
+        except Exception as exc:  # pragma: no cover - playwright edge
+            logger.warning("Failed to capture %s screenshot: %s", prefix, exc)
+            return None
+        return await asyncio.to_thread(self._store_screenshot, data, prefix, description)
+
+    async def _capture_context_screenshot(
+        self,
+        context: BrowserContext,
+        *,
+        prefix: str,
+        description: str,
+    ) -> Optional[str]:
+        page = await context.new_page()
+        try:
+            await page.goto(self._login_url, wait_until="domcontentloaded", timeout=30000)
+            return await self.capture_page_screenshot(page, prefix=prefix, description=description)
+        except Exception as exc:  # pragma: no cover - navigation issues
+            logger.warning("Failed to capture context screenshot: %s", exc)
+            return None
+        finally:
+            await page.close()
+
+    async def capture_portal_error(
+        self,
+        url: str,
+        *,
+        description: str,
+        prefix: str = "PortalError",
+    ) -> Optional[str]:
+        context = await self.get_context()
+        if not context:
+            return None
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:  # pragma: no cover - portal issues
+            logger.warning("Portal error navigation failed: %s", exc)
+        finally:
+            try:
+                path = await self.capture_page_screenshot(
+                    page,
+                    prefix=prefix,
+                    description=description,
+                )
+            finally:
+                await page.close()
+        return path
+
+    def _store_screenshot(self, data: bytes, prefix: str, description: str) -> Optional[str]:
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        name = f"{prefix}_{timestamp}.png"
+        path = self._screen_dir / name
+        try:
+            path.write_bytes(data)
+        except Exception as exc:  # pragma: no cover - filesystem issues
+            logger.error("Failed to persist screenshot %s: %s", name, exc)
+            return None
+        db.record_screenshot(name, str(path), description)
+        logger.info("Screenshot saved: %s", path)
+        return str(path)
+
+
 auth_manager = AuthManager()
 
 __all__ = ["auth_manager", "CAPTCHA_READY", "CAPTCHA_CANCEL", "CAPTCHA_MANUAL"]
