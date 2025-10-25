@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Quick smoke-check for SK Watch Bot infrastructure."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+import time
+from pathlib import Path
+
+import aiohttp
+from dotenv import load_dotenv
+
+# Ensure project root on path
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from storage import db  # noqa: E402
+
+
+async def _check_portal(url: str) -> tuple[bool, str]:
+    timeout = aiohttp.ClientTimeout(total=15)
+    headers = {"User-Agent": "sk-watch-bot-smoke/1.0"}
+    start = time.monotonic()
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, allow_redirects=True, headers=headers) as resp:
+                body = await resp.text()
+                elapsed = int((time.monotonic() - start) * 1000)
+                snippet = "Pracovisk" in body or "Pracoviská" in body
+                ok = resp.status in {200, 301, 302} and snippet
+                details = f"status={resp.status} snippet={'yes' if snippet else 'no'} latency={elapsed}ms"
+                return ok, details
+    except Exception as exc:  # pragma: no cover - network issues
+        return False, f"error={exc}"
+
+
+def load_environment() -> None:
+    env_path = os.getenv("ENV_FILE_PATH", "/opt/bot/.env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path, override=False)
+    else:
+        load_dotenv(ROOT.parent / ".env", override=False)
+
+
+def gather_stats() -> dict[str, int]:
+    counts = db.count_watches()
+    categories = db.get_categories()
+    enabled_categories = sum(1 for cat in categories if cat.get("enabled"))
+    enabled_watches = len(db.get_enabled_watches())
+    return {
+        "categories": len(categories),
+        "categories_enabled": enabled_categories,
+        "cities": len(db.get_cities()),
+        "watches_total": counts["total"],
+        "watches_enabled": counts["enabled"],
+        "watches_errors": counts["errors"],
+        "watches_active": enabled_watches,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run a lightweight smoke check")
+    parser.add_argument("--quiet", action="store_true", help="suppress normal output")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="skip portal availability probe",
+    )
+    parser.add_argument("--url", default=os.getenv("LOGIN_URL", ""), help="override portal URL")
+    args = parser.parse_args()
+
+    load_environment()
+    db.init_db()
+
+    stats = gather_stats()
+    if not args.quiet:
+        print("[smoke] storage stats:")
+        for key, value in stats.items():
+            print(f"  {key}: {value}")
+
+    success = True
+    if not args.dry_run and args.url:
+        ok, details = asyncio.run(_check_portal(args.url))
+        if not args.quiet:
+            print(f"[smoke] portal check: {details}")
+        success = success and ok
+    elif not args.url and not args.quiet:
+        print("[smoke] portal check skipped: LOGIN_URL not configured")
+
+    if not success:
+        if args.quiet:
+            print("Portal availability check failed", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

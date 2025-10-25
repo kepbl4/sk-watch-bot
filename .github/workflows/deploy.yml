@@ -1,0 +1,154 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Ensure server baseline
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+            set -e
+            apt-get update && apt-get -y install python3-venv python3-pip rsync sqlite3
+            id bot 2>/dev/null || useradd -r -m -d /opt/bot -s /usr/sbin/nologin bot
+            mkdir -p /opt/bot/{run,data,logs,backups,browser_profile,src}
+            chown -R bot:bot /opt/bot
+          '
+
+      - name: Rsync sources
+        run: |
+          rsync -av --delete \
+            --exclude ".git" --exclude ".github" --exclude "__pycache__" \
+            --exclude ".venv" --exclude "node_modules" \
+            ./ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ secrets.VPS_PATH }}/src/
+
+      - name: Install deps + Playwright
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+            set -e
+            cd /opt/bot
+            chown -R bot:bot /opt/bot/src
+            sudo -u bot python3 -m venv /opt/bot/.venv || true
+            sudo -u bot /opt/bot/.venv/bin/pip install --upgrade pip wheel
+            sudo -u bot /opt/bot/.venv/bin/pip install -r /opt/bot/src/requirements.txt
+            sudo -u bot /opt/bot/.venv/bin/python -m playwright install --with-deps chromium
+          '
+
+      - name: Write .env from secret
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+            set -e
+            cat <<"EOF" | base64 -d > /opt/bot/.env
+${{ secrets.ENV_B64 }}
+EOF
+            chmod 600 /opt/bot/.env
+            chown bot:bot /opt/bot/.env
+          '
+
+      - name: Create/Update systemd unit
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+            cat > /etc/systemd/system/bot.service << "UNIT"
+[Unit]
+Description=SK Watch Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/bot/src
+EnvironmentFile=/opt/bot/.env
+ExecStart=/opt/bot/.venv/bin/python /opt/bot/src/app.py
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+ReadWritePaths=/opt/bot
+NoNewPrivileges=yes
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+            systemctl daemon-reload
+            systemctl enable bot || true
+            systemctl restart bot
+            systemctl --no-pager --lines=40 status bot
+          '
+
+      - name: Ensure maintenance timers
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+            set -e
+            cat > /etc/systemd/system/bot-health.service << "UNIT"
+[Unit]
+Description=SK Watch Bot health check
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=bot
+Group=bot
+WorkingDirectory=/opt/bot/src
+EnvironmentFile=/opt/bot/.env
+ExecStart=/opt/bot/.venv/bin/python /opt/bot/src/scripts/smoke-check --quiet
+UNIT
+            cat > /etc/systemd/system/bot-health.timer << "UNIT"
+[Unit]
+Description=Run SK Watch Bot health check every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=1min
+Unit=bot-health.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+            cat > /etc/systemd/system/bot-dump.service << "UNIT"
+[Unit]
+Description=SK Watch Bot database backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=bot
+Group=bot
+WorkingDirectory=/opt/bot
+Environment=DB_PATH=/opt/bot/data/bot.db
+Environment=BACKUP_DIR=/opt/bot/backups
+ExecStart=/bin/bash /opt/bot/src/scripts/backup-db.sh
+UNIT
+            cat > /etc/systemd/system/bot-dump.timer << "UNIT"
+[Unit]
+Description=Nightly SK Watch Bot database backup
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+AccuracySec=1min
+Persistent=true
+Unit=bot-dump.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+            systemctl daemon-reload
+            systemctl enable --now bot-health.timer
+            systemctl enable --now bot-dump.timer
+            systemctl list-timers --all | grep bot- || true
+          '
