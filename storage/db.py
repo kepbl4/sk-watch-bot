@@ -14,27 +14,27 @@ _CONNECTION: Optional[sqlite3.Connection] = None
 _INITIALISED = False
 
 DEFAULT_CATEGORIES: Tuple[Tuple[str, str], ...] = (
-    ("UTOCISKO_REG", "Уточиско — регистрация"),
-    ("UTOCISKO_DOKLAD", "Уточиско — документы"),
-    ("PRECHODNY", "ВНЖ (временный)"),
-    ("TRVALY_5Y", "ПМЖ на 5 лет"),
-    ("TRVALY_UNLIM", "ПМЖ без срока"),
+    ("UTOCISKO_REG", "Útočisko — registrácia"),
+    ("UTOCISKO_DOKLAD", "Útočisko — doklady"),
+    ("PRECHODNY", "Prechodný pobyt"),
+    ("TRVALY_5Y", "Trvalý pobyt na 5 rokov"),
+    ("TRVALY_UNLIM", "Trvalý pobyt bez obmedzenia"),
 )
 
 DEFAULT_CITIES: Tuple[Tuple[str, str], ...] = (
-    ("banska_bystrica", "Банска-Бистрица"),
-    ("bratislava", "Братислава"),
-    ("dunajska_streda", "Дунайска-Стреда"),
-    ("kosice", "Кошице"),
-    ("michalovce", "Михаловце"),
-    ("nitra", "Нитра"),
-    ("nove_zamky", "Нове-Замки"),
-    ("presov", "Прешов"),
-    ("rimavska_sobota", "Римавска-Собота"),
-    ("ruzomberok", "Ружомберок"),
-    ("trencin", "Тренчин"),
-    ("trnava", "Трнава"),
-    ("zilina", "Жилина"),
+    ("banska_bystrica", "Banská Bystrica"),
+    ("bratislava", "Bratislava"),
+    ("dunajska_streda", "Dunajská Streda"),
+    ("kosice", "Košice"),
+    ("michalovce", "Michalovce"),
+    ("nitra", "Nitra"),
+    ("nove_zamky", "Nové Zámky"),
+    ("presov", "Prešov"),
+    ("rimavska_sobota", "Rimavská Sobota"),
+    ("ruzomberok", "Ružomberok"),
+    ("trencin", "Trenčín"),
+    ("trnava", "Trnava"),
+    ("zilina", "Žilina"),
 )
 
 
@@ -201,11 +201,18 @@ def init_db() -> None:
 def _seed(conn: sqlite3.Connection) -> None:
     category_count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
     if category_count == 0:
-        for order, (key, title) in enumerate(DEFAULT_CATEGORIES, start=1):
+        for key, title in DEFAULT_CATEGORIES:
             conn.execute(
                 "INSERT INTO categories(key, title, url, enabled, status, last_check_at, last_error) "
                 "VALUES (?, ?, '', 0, 'PAUSED', NULL, NULL)",
                 (key, title),
+            )
+    else:
+        desired_titles = dict(DEFAULT_CATEGORIES)
+        for key, title in desired_titles.items():
+            conn.execute(
+                "UPDATE categories SET title = ? WHERE key = ? AND title != ?",
+                (title, key, title),
             )
 
     city_count = conn.execute("SELECT COUNT(*) FROM cities").fetchone()[0]
@@ -214,6 +221,13 @@ def _seed(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT INTO cities(key, title, ord) VALUES (?, ?, ?)",
                 (key, title, order),
+            )
+    else:
+        desired_cities = dict(DEFAULT_CITIES)
+        for key, title in desired_cities.items():
+            conn.execute(
+                "UPDATE cities SET title = ? WHERE key = ? AND title != ?",
+                (title, key, title),
             )
 
     # Ensure watches exist for each combination.

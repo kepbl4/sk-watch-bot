@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import re
 import time
@@ -52,7 +53,7 @@ AUTH_STATUS_ICONS = {
     "OK": "✅",
     "NEED_AUTH": "🔒",
     "NEED_VPN": "🌐",
-    "NEED_CAPTCHA": "⚠️",
+    "NEED_CAPTCHA": "🧩",
     "NEED_SMS": "🔒",
     "ERROR": "⚠️",
     "WARN": "⚠️",
@@ -450,14 +451,42 @@ async def edit_summary_message(bot, chat_id: int, message_id: int, *, force_stat
             parse_mode=ParseMode.HTML,
         )
     except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return
         logger.warning("Unable to edit summary message: %s", exc)
+        target_chat = fallback_chat_id or chat_id
+        sent = await bot.send_message(
+            target_chat,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        await _save_anchor_bundle(sent.chat.id, sent.message_id)
+
+
+async def ensure_summary_message(message: Message, *, force_status: bool = False) -> None:
+    bot = message.bot
+    anchor = await run_in_thread(db.get_anchor, SUMMARY_ANCHOR)
+
+    if not anchor or anchor.get("chat_id") != message.chat.id:
+        placeholder = await message.answer("Готовлю сводку…")
+        await _save_anchor_bundle(placeholder.chat.id, placeholder.message_id)
+        anchor = {"chat_id": placeholder.chat.id, "message_id": placeholder.message_id}
+
+    await _render_summary(
+        bot,
+        anchor["chat_id"],
+        anchor["message_id"],
+        force_status=force_status,
+        fallback_chat_id=message.chat.id,
+    )
 
 
 async def refresh_summary(bot, *, force_status: bool = False) -> None:
     anchor = await run_in_thread(db.get_anchor, SUMMARY_ANCHOR)
     if not anchor:
         return
-    await edit_summary_message(
+    await _render_summary(
         bot,
         anchor["chat_id"],
         anchor["message_id"],
@@ -726,6 +755,20 @@ async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
             ]
         )
     keyboard_rows.append(
+        [InlineKeyboardButton(text="Отчёт об ошибке", callback_data="admin:failure_report")]
+    )
+    if screenshots:
+        for shot in screenshots:
+            created = _format_datetime(shot.get("created_at"), "%d.%m %H:%M:%S")
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{created} • {shot.get('name')}",
+                        callback_data=f"admin:screen:{shot.get('name')}",
+                    )
+                ]
+            )
+    keyboard_rows.append(
         [
             InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back"),
         ]
@@ -921,6 +964,113 @@ async def handle_captcha_manual(callback: CallbackQuery) -> None:
     await callback.answer("Переключаюсь в ручной режим", show_alert=True)
 
 
+def _collect_error_snippet(log_path: str) -> str:
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return "Лог-файл не найден"
+
+    if not lines:
+        return "Лог пуст"
+
+    error_indices = [
+        idx for idx, line in enumerate(lines) if "ERROR" in line or "Traceback" in line
+    ]
+    if error_indices:
+        idx = error_indices[-1]
+        start = max(0, idx - 10)
+        end = min(len(lines), idx + 20)
+    else:
+        start = max(0, len(lines) - 50)
+        end = len(lines)
+
+    snippet = "".join(lines[start:end]).strip()
+    return snippet or "Лог пуст"
+
+
+async def build_failure_report() -> str:
+    parts: List[str] = []
+    parts.append(f"Snapshot: {datetime.utcnow().isoformat()}Z")
+
+    auth_state = await run_in_thread(db.settings_get, "auth_state", "")
+    auth_exp = await run_in_thread(db.settings_get, "auth_exp", "")
+    system_state = await run_in_thread(db.settings_get, "auth_system_state", "")
+    system_hint = await run_in_thread(db.settings_get, "auth_system_hint", "")
+    sms_pending = await run_in_thread(db.settings_get, "auth_sms_pending", "0")
+
+    parts.append(f"Auth state: {auth_state or '—'}")
+    if auth_exp:
+        parts.append(f"Auth valid until: {auth_exp}")
+    if system_state:
+        line = f"System check: {system_state}"
+        if system_hint:
+            line += f" ({system_hint})"
+        parts.append(line)
+    if sms_pending == "1":
+        parts.append("SMS pending: yes")
+
+    portal_state = await run_in_thread(db.settings_get, "portal_state", "")
+    portal_error = await run_in_thread(db.settings_get, "portal_error", "")
+    portal_code = await run_in_thread(db.settings_get, "portal_code", "")
+    portal_latency = await run_in_thread(db.settings_get, "portal_latency_ms", "")
+    vpn_state = await run_in_thread(db.settings_get, "vpn_state", "")
+    vpn_error = await run_in_thread(db.settings_get, "vpn_error", "")
+
+    parts.append(
+        f"Portal: {portal_state or '—'} (HTTP {portal_code or '—'}, {portal_latency or '—'} ms)"
+    )
+    if portal_error:
+        parts.append(f"Portal note: {portal_error}")
+    parts.append(f"VPN: {vpn_state or '—'}")
+    if vpn_error:
+        parts.append(f"VPN note: {vpn_error}")
+
+    pulses = await run_in_thread(db.get_recent_portal_pulses, 3)
+    if pulses:
+        parts.append("Portal pulses:")
+        for pulse in pulses:
+            parts.append(
+                "  - "
+                f"{pulse.get('recorded_at', '—')} • {pulse.get('status', '—')} "
+                f"lat {pulse.get('latency_ms') or '—'} ms • HTTP {pulse.get('http_status') or '—'} "
+                f"{pulse.get('error') or ''}".strip()
+            )
+
+    diag_entries = await run_in_thread(db.get_latest_diagnostics, 20)
+    failed = [d for d in diag_entries if (d.get("status") or "").upper() != "OK"]
+    if failed:
+        parts.append("Diagnostics issues:")
+        for item in failed[:5]:
+            parts.append(
+                "  - "
+                f"{item.get('recorded_at', '—')} • {item.get('category_code', '—')}/{item.get('city_key', '—')} "
+                f"status {item.get('status', '—')} • HTTP {item.get('http_status') or '—'} "
+                f"len {item.get('content_len') or '—'} • diff {item.get('diff_len') or '—'}"
+            )
+            comment = item.get("comment") or item.get("diff_anchor") or item.get("anchor_hash")
+            if comment:
+                parts.append(f"      note: {comment}")
+
+    pulses_log = await run_in_thread(db.get_recent_pulses, 5)
+    if pulses_log:
+        parts.append("Pulses:")
+        for pulse in pulses_log:
+            parts.append(
+                "  - "
+                f"{pulse.get('created_at', '—')} • {pulse.get('kind', '—')} "
+                f"{pulse.get('status', '—')} • {pulse.get('note', '')}".strip()
+            )
+
+    logs_path = os.getenv("LOG_FILE", "/opt/bot/logs/bot.log")
+    snippet = await run_in_thread(_collect_error_snippet, logs_path)
+    if snippet:
+        parts.append("--- Log snippet ---")
+        parts.append(snippet)
+
+    return "\n".join(parts)
+
+
 @router.callback_query(F.data.startswith("admin:logs:"))
 async def handle_logs(callback: CallbackQuery) -> None:
     if OWNER_ID and callback.from_user.id != OWNER_ID:
@@ -938,6 +1088,18 @@ async def handle_logs(callback: CallbackQuery) -> None:
     text = "<pre>" + "".join(lines)[-3500:] + "</pre>"
     await callback.message.answer(text, parse_mode=ParseMode.HTML)
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin:failure_report")
+async def handle_failure_report(callback: CallbackQuery) -> None:
+    if OWNER_ID and callback.from_user.id != OWNER_ID:
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    report = await build_failure_report()
+    escaped = html.escape(report)
+    await callback.message.answer(f"<pre>{escaped}</pre>", parse_mode=ParseMode.HTML)
+    await callback.answer("Отчёт отправлен")
 
 
 @router.callback_query(F.data == "admin:interval")
