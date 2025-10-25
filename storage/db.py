@@ -151,6 +151,46 @@ def init_db() -> None:
                 chat_id INTEGER,
                 message_id INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS diagnostics (
+                id INTEGER PRIMARY KEY,
+                recorded_at TEXT,
+                category_code TEXT,
+                city_key TEXT,
+                url TEXT,
+                status TEXT,
+                http_status INTEGER,
+                content_len INTEGER,
+                anchor_hash TEXT,
+                diff_len INTEGER,
+                diff_anchor TEXT,
+                comment TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS portal_pulses (
+                id INTEGER PRIMARY KEY,
+                recorded_at TEXT,
+                status TEXT,
+                latency_ms INTEGER,
+                http_status INTEGER,
+                error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS screenshots (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                path TEXT,
+                description TEXT,
+                created_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS pulses (
+                id INTEGER PRIMARY KEY,
+                created_at TEXT,
+                kind TEXT,
+                status TEXT,
+                note TEXT
+            );
             """
         )
 
@@ -441,6 +481,155 @@ def mark_finding_notified(finding_id: int, when_iso: Optional[str] = None) -> No
         )
 
 
+def record_diagnostic(
+    *,
+    recorded_at: Optional[str],
+    category_code: str,
+    city_key: str,
+    url: str,
+    status: str,
+    http_status: Optional[int],
+    content_len: int,
+    anchor_hash: str,
+    diff_len: int,
+    diff_anchor: str,
+    comment: str,
+) -> None:
+    timestamp = recorded_at or datetime.utcnow().isoformat()
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO diagnostics(
+                recorded_at, category_code, city_key, url, status, http_status,
+                content_len, anchor_hash, diff_len, diff_anchor, comment
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp,
+                category_code,
+                city_key,
+                url,
+                status,
+                http_status,
+                content_len,
+                anchor_hash,
+                diff_len,
+                diff_anchor,
+                comment,
+            ),
+        )
+
+
+def get_last_diagnostic(category_code: str, city_key: str) -> Optional[Dict[str, Any]]:
+    with _cursor() as cur:
+        row = cur.execute(
+            """
+            SELECT * FROM diagnostics
+            WHERE category_code = ? AND city_key = ?
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT 1
+            """,
+            (category_code, city_key),
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_latest_diagnostics(limit: int = 100) -> List[Dict[str, Any]]:
+    query = """
+        SELECT d.*
+        FROM diagnostics d
+        INNER JOIN (
+            SELECT category_code, city_key, MAX(recorded_at) AS recorded_at
+            FROM diagnostics
+            GROUP BY category_code, city_key
+        ) latest
+        ON latest.category_code = d.category_code
+        AND latest.city_key = d.city_key
+        AND latest.recorded_at = d.recorded_at
+        ORDER BY d.recorded_at DESC
+        LIMIT ?
+    """
+    with _cursor() as cur:
+        rows = cur.execute(query, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def record_portal_pulse(
+    *,
+    recorded_at: Optional[str],
+    status: str,
+    latency_ms: Optional[int],
+    http_status: Optional[int],
+    error: Optional[str],
+) -> None:
+    timestamp = recorded_at or datetime.utcnow().isoformat()
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO portal_pulses(recorded_at, status, latency_ms, http_status, error)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (timestamp, status, latency_ms, http_status, error),
+        )
+
+
+def get_recent_portal_pulses(limit: int = 10) -> List[Dict[str, Any]]:
+    with _cursor() as cur:
+        rows = cur.execute(
+            "SELECT * FROM portal_pulses ORDER BY recorded_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def record_screenshot(name: str, path: str, description: str, *, created_at: Optional[str] = None) -> None:
+    timestamp = created_at or datetime.utcnow().isoformat()
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO screenshots(name, path, description, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (name, path, description, timestamp),
+        )
+
+
+def get_recent_screenshots(limit: int = 5) -> List[Dict[str, Any]]:
+    with _cursor() as cur:
+        rows = cur.execute(
+            "SELECT * FROM screenshots ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_screenshot(name: str) -> Optional[Dict[str, Any]]:
+    with _cursor() as cur:
+        row = cur.execute(
+            "SELECT * FROM screenshots WHERE name = ? ORDER BY created_at DESC LIMIT 1",
+            (name,),
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def record_pulse(kind: str, status: str, note: str, *, created_at: Optional[str] = None) -> None:
+    timestamp = created_at or datetime.utcnow().isoformat()
+    with _cursor() as cur:
+        cur.execute(
+            "INSERT INTO pulses(created_at, kind, status, note) VALUES (?, ?, ?, ?)",
+            (timestamp, kind, status, note),
+        )
+
+
+def get_recent_pulses(limit: int = 10) -> List[Dict[str, Any]]:
+    with _cursor() as cur:
+        rows = cur.execute(
+            "SELECT * FROM pulses ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def save_anchor(name: str, chat_id: int, message_id: int) -> None:
     with _cursor() as cur:
         cur.execute(
@@ -559,4 +748,14 @@ __all__ = [
     "list_tracked_watches",
     "create_run",
     "finish_run",
+    "record_diagnostic",
+    "get_last_diagnostic",
+    "get_latest_diagnostics",
+    "record_portal_pulse",
+    "get_recent_portal_pulses",
+    "record_screenshot",
+    "get_recent_screenshots",
+    "get_screenshot",
+    "record_pulse",
+    "get_recent_pulses",
 ]

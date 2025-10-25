@@ -14,7 +14,13 @@ from aiogram import F, Router
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from auth.flow import CAPTCHA_CANCEL, CAPTCHA_MANUAL, CAPTCHA_READY, auth_manager
 from storage import db
@@ -27,6 +33,7 @@ SUMMARY_ANCHOR = "summary"
 CATEGORIES_ANCHOR = "categories"
 TRACKED_ANCHOR = "tracked"
 ADMIN_ANCHOR = "admin"
+DIAGNOSTIC_ANCHOR = "diagnostics"
 
 STATUS_ICONS = {
     None: "⏸",
@@ -38,6 +45,7 @@ STATUS_ICONS = {
     "ERROR": "⚠️",
     "NEED_AUTH": "🔒",
     "NEED_VPN": "🌐",
+    "SLOW": "🟡",
 }
 
 AUTH_STATUS_ICONS = {
@@ -47,6 +55,7 @@ AUTH_STATUS_ICONS = {
     "NEED_CAPTCHA": "⚠️",
     "NEED_SMS": "🔒",
     "ERROR": "⚠️",
+    "WARN": "⚠️",
 }
 
 INTERVAL_MINUTES = 10
@@ -65,8 +74,8 @@ def configure(interval: int, owner_id: Optional[int]) -> None:
     OWNER_ID = owner_id
 
 
-async def run_in_thread(func, *args):
-    return await asyncio.to_thread(func, *args)
+async def run_in_thread(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 async def _read_connectivity_snapshot() -> Dict[str, Any]:
@@ -110,12 +119,16 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
     portal_code = ""
     portal_latency = ""
     portal_error = ""
+    portal_status = "ERR ⚠️"
 
     timeout = aiohttp.ClientTimeout(total=10)
     headers = {"User-Agent": "sk-watch-bot/1.0", "Accept": "application/json"}
     login_url = os.getenv("LOGIN_URL", "")
+    ignore_https = os.getenv("IGNORE_HTTPS_ERRORS", "false").lower() == "true"
+    connector = aiohttp.TCPConnector(ssl=False) if ignore_https else None
+    latency_threshold = int(os.getenv("PORTAL_SLOW_THRESHOLD_MS", "4000") or 4000)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         # VPN / geo check
         try:
             start = time.monotonic()
@@ -138,21 +151,75 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
         if login_url:
             try:
                 start = time.monotonic()
-                async with session.get(login_url, allow_redirects=False) as resp:
-                    elapsed = int((time.monotonic() - start) * 1000)
-                    portal_latency = str(elapsed)
-                    portal_code = str(resp.status)
-                    if resp.status in {200, 301, 302}:
-                        portal_state = "OK"
-                    else:
-                        portal_state = "ERR"
-                        portal_error = f"HTTP {resp.status}"
+                status_code = None
+                elapsed = 0
+                try:
+                    async with session.head(login_url, allow_redirects=False) as resp:
+                        status_code = resp.status
+                        elapsed = int((time.monotonic() - start) * 1000)
+                except Exception:
+                    status_code = None
+
+                if status_code == 405:
+                    logger.debug("Portal HEAD returned 405, retrying with GET")
+                if status_code == 405 or status_code is None:
+                    start = time.monotonic()
+                    async with session.get(login_url, allow_redirects=False) as resp:
+                        status_code = resp.status
+                        await resp.read()
+                        elapsed = int((time.monotonic() - start) * 1000)
+                portal_latency = str(elapsed)
+                portal_code = str(status_code)
+                method_note = None
+                if status_code == 405:
+                    portal_state = "OK"
+                    method_note = "method not allowed"
+                elif status_code in {200, 301, 302}:
+                    portal_state = "OK"
+                    if elapsed > latency_threshold:
+                        portal_state = "SLOW"
+                        portal_error = f"latency {elapsed} ms"
+                else:
+                    portal_state = "ERR"
+                    portal_error = f"HTTP {status_code}"
+                await asyncio.to_thread(
+                    db.record_portal_pulse,
+                    recorded_at=datetime.utcnow().isoformat(),
+                    status=portal_state,
+                    latency_ms=elapsed,
+                    http_status=status_code,
+                    error=portal_error or method_note,
+                )
+                if portal_state == "ERR":
+                    logger.warning("Portal sensor error: %s", portal_error)
+                    await auth_manager.capture_portal_error(
+                        login_url, description=portal_error or "portal error"
+                )
+                if method_note and not portal_error:
+                    portal_error = method_note
             except Exception as exc:  # pragma: no cover - network issues
                 portal_state = "ERR"
                 portal_error = str(exc)
+                await asyncio.to_thread(
+                    db.record_portal_pulse,
+                    recorded_at=datetime.utcnow().isoformat(),
+                    status=portal_state,
+                    latency_ms=None,
+                    http_status=None,
+                    error=portal_error,
+                )
+                await auth_manager.capture_portal_error(login_url or "about:blank", description=portal_error)
         else:
             portal_state = "ERR"
             portal_error = "LOGIN_URL not configured"
+            await asyncio.to_thread(
+                db.record_portal_pulse,
+                recorded_at=datetime.utcnow().isoformat(),
+                status=portal_state,
+                latency_ms=None,
+                http_status=None,
+                error=portal_error,
+            )
 
     display_vpn = "ERR"
     if vpn_state == "OK":
@@ -162,7 +229,12 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
     else:
         display_vpn = "ERR"
 
-    display_portal = "OK ✅" if portal_state == "OK" else "ERR ⚠️"
+    if portal_state == "OK":
+        portal_status = "OK ✅"
+    elif portal_state == "SLOW":
+        portal_status = "SLOW 🟡"
+    else:
+        portal_status = "ERR ⚠️"
 
     now_iso = datetime.utcnow().isoformat()
     await run_in_thread(db.settings_set, "vpn_state", vpn_state)
@@ -175,7 +247,7 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
     await run_in_thread(db.settings_set, "portal_latency_ms", portal_latency)
     await run_in_thread(db.settings_set, "portal_error", portal_error)
     await run_in_thread(db.settings_set, "vpn_status", display_vpn)
-    await run_in_thread(db.settings_set, "portal_status", display_portal)
+    await run_in_thread(db.settings_set, "portal_status", portal_status)
     await run_in_thread(db.settings_set, "connectivity_checked_at", now_iso)
 
     snapshot.update(
@@ -190,7 +262,7 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
             "portal_latency_ms": portal_latency,
             "portal_error": portal_error,
             "vpn_status": display_vpn,
-            "portal_status": display_portal,
+            "portal_status": portal_status,
             "connectivity_checked_at": now_iso,
         }
     )
@@ -240,7 +312,7 @@ async def _pending_findings_count() -> Counter:
     return counter
 
 
-async def build_summary_text(force_status: bool = False) -> str:
+async def build_summary_text(force_status: bool = False) -> Tuple[str, bool]:
     snapshot = await ensure_connectivity_status(force=force_status)
     categories = await run_in_thread(db.get_categories)
     pending_per_category = await _pending_findings_count()
@@ -259,15 +331,24 @@ async def build_summary_text(force_status: bool = False) -> str:
 
     vpn_status = snapshot.get("vpn_status") or "ERR"
     portal_status = snapshot.get("portal_status") or "ERR"
+    system_state = await run_in_thread(db.settings_get, "auth_system_state", "OK")
+    system_hint = await run_in_thread(db.settings_get, "auth_system_hint", "")
+    sms_pending = await run_in_thread(db.settings_get, "auth_sms_pending", "0")
+
     auth_state = await run_in_thread(db.settings_get, "auth_state", "NEED_AUTH")
     auth_until = await run_in_thread(db.settings_get, "auth_exp", "")
-    if auth_state == "OK" and auth_until:
+    display_state = auth_state
+    if system_state == "WARN" and auth_state in {"OK", ""}:
+        display_state = "WARN"
+
+    if display_state == "OK" and auth_until:
         auth_label = f"OK до {_format_datetime(auth_until, '%H:%M')}"
-    elif auth_state == "OK":
-        auth_label = "OK"
+    elif display_state == "WARN" and auth_until:
+        auth_label = f"WARN до {_format_datetime(auth_until, '%H:%M')}"
     else:
-        auth_label = auth_state
-    icon = AUTH_STATUS_ICONS.get(auth_state)
+        auth_label = display_state
+
+    icon = AUTH_STATUS_ICONS.get(display_state)
     if icon and not auth_label.startswith(icon):
         auth_label = f"{icon} {auth_label}"
 
@@ -277,19 +358,27 @@ async def build_summary_text(force_status: bool = False) -> str:
         f"VPN: {vpn_status}",
         f"Портал: {portal_status}",
         f"Авторизация: {auth_label}",
-        "",
-        f"Интервал: {INTERVAL_MINUTES} минут",
-        "",
-        "Категории:",
     ]
+    if system_state == "WARN" and system_hint:
+        summary_lines.append(f"⚠️ Система: {system_hint}")
+    summary_lines.append("")
+    if sms_pending == "1":
+        summary_lines.append("SMS-код: ждём ввод в ответ на сообщение")
+    summary_lines.extend(
+        [
+            f"Интервал: {INTERVAL_MINUTES} минут",
+            "",
+            "Категории:",
+        ]
+    )
     summary_lines.extend(lines or ["—"])
     summary_lines.extend(["", "Последние события:"])
     summary_lines.extend(await _recent_events())
     summary_lines.extend(["", f"Активных целей: {total_active}"])
-    return "\n".join(summary_lines)
+    return "\n".join(summary_lines), sms_pending == "1"
 
 
-def summary_keyboard() -> InlineKeyboardMarkup:
+def summary_keyboard(*, sms_pending: bool) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton(
@@ -299,19 +388,30 @@ def summary_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="Категории", callback_data="summary:categories"),
-            InlineKeyboardButton(text="Состояние VPN", callback_data="summary:vpn"),
+            InlineKeyboardButton(text="Диагностика", callback_data="summary:diagnostics"),
         ],
         [
             InlineKeyboardButton(text="Отслеживаемое", callback_data="summary:tracked"),
-            InlineKeyboardButton(text="Авторизация", callback_data="summary:auth"),
+            InlineKeyboardButton(text="Панель", callback_data="summary:admin"),
         ],
     ]
+    if sms_pending:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text="Отправь код в ответ", callback_data="auth:sms_help"
+                )
+            ]
+        )
+    keyboard.append(
+        [InlineKeyboardButton(text="Состояние VPN", callback_data="summary:vpn")]
+    )
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 async def ensure_summary_message(message: Message, *, force_status: bool = False) -> None:
-    text = await build_summary_text(force_status=force_status)
-    keyboard = summary_keyboard()
+    text, sms_pending = await build_summary_text(force_status=force_status)
+    keyboard = summary_keyboard(sms_pending=sms_pending)
     anchor = await run_in_thread(db.get_anchor, SUMMARY_ANCHOR)
     bot = message.bot
 
@@ -333,16 +433,17 @@ async def ensure_summary_message(message: Message, *, force_status: bool = False
     await run_in_thread(db.save_anchor, CATEGORIES_ANCHOR, message.chat.id, sent.message_id)
     await run_in_thread(db.save_anchor, TRACKED_ANCHOR, message.chat.id, sent.message_id)
     await run_in_thread(db.save_anchor, ADMIN_ANCHOR, message.chat.id, sent.message_id)
+    await run_in_thread(db.save_anchor, DIAGNOSTIC_ANCHOR, message.chat.id, sent.message_id)
 
 
 async def edit_summary_message(bot, chat_id: int, message_id: int, *, force_status: bool = False) -> None:
-    text = await build_summary_text(force_status=force_status)
+    text, sms_pending = await build_summary_text(force_status=force_status)
     try:
         await bot.edit_message_text(
             text=text,
             chat_id=chat_id,
             message_id=message_id,
-            reply_markup=summary_keyboard(),
+            reply_markup=summary_keyboard(sms_pending=sms_pending),
             parse_mode=ParseMode.HTML,
         )
     except TelegramBadRequest as exc:
@@ -386,13 +487,9 @@ async def build_categories_view() -> Tuple[str, InlineKeyboardMarkup]:
                 ),
             ]
         )
-    keyboard_rows.append(
-        [
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back"),
-            InlineKeyboardButton(text="Отслеживаемое", callback_data="summary:tracked"),
-            InlineKeyboardButton(text="Панель", callback_data="summary:admin"),
-        ]
-    )
+    keyboard_rows.append([InlineKeyboardButton(text="Отслеживаемое", callback_data="summary:tracked")])
+    keyboard_rows.append([InlineKeyboardButton(text="Панель", callback_data="summary:admin")])
+    keyboard_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
 
@@ -497,10 +594,52 @@ async def build_tracked_view() -> Tuple[str, InlineKeyboardMarkup]:
     return text, keyboard
 
 
+async def build_diagnostics_view() -> Tuple[str, InlineKeyboardMarkup]:
+    records = await run_in_thread(db.get_latest_diagnostics, 60)
+    lines = ["<b>Диагностика</b>", "Последние проверки по целям:", ""]
+    if not records:
+        lines.append("—")
+    else:
+        for item in records:
+            recorded = _format_datetime(item.get("recorded_at"), "%d.%m %H:%M")
+            http_code = item.get("http_status") or "—"
+            length = item.get("content_len") or 0
+            diff_len = int(item.get("diff_len") or 0)
+            if diff_len > 0:
+                trend = "↑"
+            elif diff_len < 0:
+                trend = "↓"
+            else:
+                trend = "≡"
+            anchor_state = (item.get("diff_anchor") or "").lower()
+            if anchor_state == "changed":
+                anchor_flag = "⚠️"
+            elif anchor_state == "new":
+                anchor_flag = "🆕"
+            else:
+                anchor_flag = ""
+            comment = item.get("comment") or item.get("status") or ""
+            lines.append(
+                f"{recorded} • {item.get('category_code')}/{item.get('city_key')} • HTTP {http_code} • len {length} {trend} {anchor_flag}".strip()
+            )
+            if comment:
+                lines.append(f"↳ {comment}")
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Проверить всё сейчас", callback_data="summary:check_all")],
+            [InlineKeyboardButton(text="Обновить", callback_data="diagnostics:refresh")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back")],
+        ]
+    )
+    return "\n".join(lines), keyboard
+
+
 async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
     categories = await run_in_thread(db.get_categories)
     interval = await run_in_thread(db.settings_get, "CHECK_INTERVAL_MIN", str(INTERVAL_MINUTES))
     notify_lang = await run_in_thread(db.settings_get, "notify_lang", "ru")
+    portal_pulses = await run_in_thread(db.get_recent_portal_pulses, 5)
+    screenshots = await run_in_thread(db.get_recent_screenshots, 5)
     lines = ["<b>Панель управления</b>", "URL категорий:"]
     for cat in categories:
         url = cat.get("url") or "—"
@@ -514,6 +653,26 @@ async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
             "Автоперезапуск в 05:00: включен",
         ]
     )
+    lines.append("")
+    lines.append("Датчик портала:")
+    if portal_pulses:
+        for pulse in portal_pulses:
+            checked = _format_datetime(pulse.get("recorded_at"), "%d.%m %H:%M:%S")
+            state = pulse.get("status")
+            latency = pulse.get("latency_ms") or "—"
+            code = pulse.get("http_status") or "—"
+            error = pulse.get("error") or ""
+            lines.append(f"{checked} • {state} • {latency} мс • HTTP {code} {error}")
+    else:
+        lines.append("—")
+    lines.append("")
+    lines.append("Последние скрины:")
+    if screenshots:
+        for shot in screenshots:
+            created = _format_datetime(shot.get("created_at"), "%d.%m %H:%M:%S")
+            lines.append(f"{created} — {shot.get('name')}")
+    else:
+        lines.append("—")
 
     keyboard_rows = [
         [
@@ -521,6 +680,9 @@ async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text="Язык уведомлений", callback_data="admin:lang"),
         ]
     ]
+    keyboard_rows.append(
+        [InlineKeyboardButton(text="Обновить авторизацию", callback_data="admin:auth")]
+    )
     for cat in categories:
         keyboard_rows.append(
             [
@@ -541,10 +703,20 @@ async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text="Логи (100)", callback_data="admin:logs:100"),
         ]
     )
+    if screenshots:
+        for shot in screenshots:
+            created = _format_datetime(shot.get("created_at"), "%d.%m %H:%M:%S")
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{created} • {shot.get('name')}",
+                        callback_data=f"admin:screen:{shot.get('name')}",
+                    )
+                ]
+            )
     keyboard_rows.append(
         [
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:categories"),
-            InlineKeyboardButton(text="Сводка", callback_data="summary:back"),
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back"),
         ]
     )
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
@@ -596,6 +768,21 @@ async def handle_show_admin(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "summary:diagnostics")
+async def handle_show_diagnostics(callback: CallbackQuery) -> None:
+    text, keyboard = await build_diagnostics_view()
+    await _edit_message(callback, text, keyboard)
+    await run_in_thread(db.save_anchor, DIAGNOSTIC_ANCHOR, callback.message.chat.id, callback.message.message_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "diagnostics:refresh")
+async def handle_diagnostics_refresh(callback: CallbackQuery) -> None:
+    text, keyboard = await build_diagnostics_view()
+    await _edit_message(callback, text, keyboard)
+    await callback.answer("Обновлено")
+
+
 @router.callback_query(F.data == "summary:back")
 async def handle_back(callback: CallbackQuery) -> None:
     await ensure_summary_message(callback.message)
@@ -645,6 +832,7 @@ async def handle_toggle_city(callback: CallbackQuery) -> None:
 async def handle_check_all(callback: CallbackQuery) -> None:
     await scheduler.enqueue_full_check(priority=True, reason="manual")
     await callback.answer("Проверка добавлена в очередь", show_alert=False)
+    await asyncio.to_thread(db.record_pulse, "summary_check", "queued", "manual")
 
 
 @router.callback_query(F.data.startswith("cat:check:"))
@@ -652,6 +840,7 @@ async def handle_category_check(callback: CallbackQuery) -> None:
     _, _, cat_key = callback.data.partition("cat:check:")
     await scheduler.enqueue_category_check(cat_key, priority=True, reason="manual")
     await callback.answer("Категория поставлена на проверку")
+    await asyncio.to_thread(db.record_pulse, "category_check", "queued", cat_key)
 
 
 @router.callback_query(F.data == "tracked:pause_all")
@@ -698,16 +887,6 @@ async def handle_vpn_status(callback: CallbackQuery) -> None:
     await callback.answer("\n".join(lines), show_alert=True)
 
 
-@router.callback_query(F.data == "summary:auth")
-async def handle_auth(callback: CallbackQuery) -> None:
-    await callback.answer("Проверяю авторизацию…", show_alert=False)
-    state = await auth_manager.ensure_auth(callback.message.bot, manual=True, force=True)
-    await run_in_thread(db.settings_set, "auth_state", state)
-    await refresh_summary(callback.message.bot)
-    text = "Авторизация: OK" if state == "OK" else f"Авторизация: {state}"
-    await callback.answer(text, show_alert=True)
-
-
 @router.callback_query(F.data == CAPTCHA_READY)
 async def handle_captcha_ready(callback: CallbackQuery) -> None:
     await auth_manager.resolve_captcha(True)
@@ -718,6 +897,11 @@ async def handle_captcha_ready(callback: CallbackQuery) -> None:
 async def handle_captcha_cancel(callback: CallbackQuery) -> None:
     await auth_manager.resolve_captcha(False)
     await callback.answer("Остановлено", show_alert=True)
+
+
+@router.callback_query(F.data == "auth:sms_help")
+async def handle_sms_help(callback: CallbackQuery) -> None:
+    await callback.answer("Отправьте SMS-код ответом на сообщение в чате", show_alert=True)
 
 
 @router.callback_query(F.data == CAPTCHA_MANUAL)
@@ -784,6 +968,62 @@ async def handle_admin_screenshot(callback: CallbackQuery) -> None:
         await callback.answer("Не удалось сделать скрин", show_alert=True)
         return
     await callback.message.answer_photo(photo)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:auth")
+async def handle_admin_auth(callback: CallbackQuery) -> None:
+    if OWNER_ID and callback.from_user.id != OWNER_ID:
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    await callback.answer("Запускаю авторизацию…")
+    state = await auth_manager.ensure_auth(callback.message.bot, manual=True, force=True)
+    await run_in_thread(db.settings_set, "auth_state", state)
+    await refresh_summary(callback.message.bot)
+    text = "Авторизация: OK" if state == "OK" else f"Авторизация: {state}"
+    await callback.message.answer(text)
+
+
+@router.callback_query(F.data == "admin:screenshots")
+async def handle_admin_screenshots(callback: CallbackQuery) -> None:
+    if OWNER_ID and callback.from_user.id != OWNER_ID:
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    shots = await run_in_thread(db.get_recent_screenshots, 5)
+    if not shots:
+        await callback.answer("Скриншоты не найдены", show_alert=True)
+        return
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"{_format_datetime(s['created_at'], '%d.%m %H:%M:%S')} — {s['name']}",
+                callback_data=f"admin:screen:{s['name']}",
+            )
+        ]
+        for s in shots
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.answer("Последние скриншоты:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:screen:"))
+async def handle_admin_screen(callback: CallbackQuery) -> None:
+    if OWNER_ID and callback.from_user.id != OWNER_ID:
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    _, _, name = callback.data.partition("admin:screen:")
+    shot = await run_in_thread(db.get_screenshot, name)
+    if not shot:
+        await callback.answer("Скриншот не найден", show_alert=True)
+        return
+    path = shot.get("path")
+    if not path or not os.path.exists(path):
+        await callback.answer("Файл недоступен", show_alert=True)
+        return
+    file = FSInputFile(path)
+    caption = shot.get("description") or name
+    await callback.message.answer_photo(file, caption=caption)
     await callback.answer()
 
 
