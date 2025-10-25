@@ -175,6 +175,7 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                     portal_state = "OK"
                     method_note = "method not allowed"
                 elif status_code in {200, 301, 302}:
+                if status_code in {200, 301, 302}:
                     portal_state = "OK"
                     if elapsed > latency_threshold:
                         portal_state = "SLOW"
@@ -189,6 +190,7 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                     latency_ms=elapsed,
                     http_status=status_code,
                     error=portal_error or method_note,
+                    error=portal_error,
                 )
                 if portal_state == "ERR":
                     logger.warning("Portal sensor error: %s", portal_error)
@@ -197,6 +199,7 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                 )
                 if method_note and not portal_error:
                     portal_error = method_note
+                    )
             except Exception as exc:  # pragma: no cover - network issues
                 portal_state = "ERR"
                 portal_error = str(exc)
@@ -714,6 +717,14 @@ async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
                     )
                 ]
             )
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Последние скрины",
+                    callback_data="admin:screenshots",
+                )
+            ]
+        )
     keyboard_rows.append(
         [
             InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back"),
