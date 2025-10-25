@@ -1,0 +1,8 @@
+aiogram==3.4.1
+python-dotenv==1.0.1
+playwright==1.48.0
+APScheduler==3.10.4
+pydantic==2.9.2
+sqlite-utils==3.36
+loguru==0.7.2
+aiohttp==3.9.5

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Inspect SQLite state for SK Watch Bot."""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from storage import db  # noqa: E402
+
+
+def load_environment() -> None:
+    env_path = os.getenv("ENV_FILE_PATH", "/opt/bot/.env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path, override=False)
+    else:
+        load_dotenv(ROOT.parent / ".env", override=False)
+
+
+def main() -> int:
+    load_environment()
+    db.init_db()
+
+    categories = db.get_categories()
+    cities = db.get_cities()
+    watches = db.get_watches_by_category(categories[0]["key"]) if categories else []
+    counts = db.count_watches()
+
+    print("[inspect] categories:")
+    for cat in categories:
+        print(
+            f"  {cat['key']}: enabled={cat['enabled']} status={cat.get('status') or 'PAUSED'} url={cat.get('url') or '-'}"
+        )
+    print("[inspect] cities count:", len(cities))
+    print(
+        f"[inspect] watches: total={counts['total']} enabled={counts['enabled']} errors={counts['errors']}"
+    )
+    if watches:
+        sample = watches[0]
+        print(
+            "[inspect] sample watch:",
+            f"category={sample['category_key']} city={sample['city_key']} status={sample.get('status')}",
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
