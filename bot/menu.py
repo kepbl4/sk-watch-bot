@@ -74,8 +74,8 @@ def configure(interval: int, owner_id: Optional[int]) -> None:
     OWNER_ID = owner_id
 
 
-async def run_in_thread(func, *args):
-    return await asyncio.to_thread(func, *args)
+async def run_in_thread(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 async def _read_connectivity_snapshot() -> Dict[str, Any]:
@@ -158,6 +158,11 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                         status_code = resp.status
                         elapsed = int((time.monotonic() - start) * 1000)
                 except Exception:
+                    status_code = None
+
+                if status_code == 405:
+                    logger.debug("Portal HEAD returned 405, retrying with GET")
+                if status_code == 405 or status_code is None:
                     start = time.monotonic()
                     async with session.get(login_url, allow_redirects=False) as resp:
                         status_code = resp.status
@@ -165,6 +170,11 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                         elapsed = int((time.monotonic() - start) * 1000)
                 portal_latency = str(elapsed)
                 portal_code = str(status_code)
+                method_note = None
+                if status_code == 405:
+                    portal_state = "OK"
+                    method_note = "method not allowed"
+                elif status_code in {200, 301, 302}:
                 if status_code in {200, 301, 302}:
                     portal_state = "OK"
                     if elapsed > latency_threshold:
@@ -179,12 +189,16 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                     status=portal_state,
                     latency_ms=elapsed,
                     http_status=status_code,
+                    error=portal_error or method_note,
                     error=portal_error,
                 )
                 if portal_state == "ERR":
                     logger.warning("Portal sensor error: %s", portal_error)
                     await auth_manager.capture_portal_error(
                         login_url, description=portal_error or "portal error"
+                )
+                if method_note and not portal_error:
+                    portal_error = method_note
                     )
             except Exception as exc:  # pragma: no cover - network issues
                 portal_state = "ERR"
@@ -693,6 +707,16 @@ async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
         ]
     )
     if screenshots:
+        for shot in screenshots:
+            created = _format_datetime(shot.get("created_at"), "%d.%m %H:%M:%S")
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{created} • {shot.get('name')}",
+                        callback_data=f"admin:screen:{shot.get('name')}",
+                    )
+                ]
+            )
         keyboard_rows.append(
             [
                 InlineKeyboardButton(

@@ -230,11 +230,26 @@ class AuthManager:
                     description="Успешный вход в портал",
                 )
                 return "OK"
+            await self.capture_page_screenshot(
+                page,
+                prefix="LoginState",
+                description=f"Авторизация завершена с состоянием {state}",
+            )
             return state
         except PlaywrightTimeoutError:
+            await self.capture_page_screenshot(
+                page,
+                prefix="LoginTimeout",
+                description="Таймаут авторизации",
+            )
             return "NEED_VPN"
         except Exception as exc:  # pragma: no cover - login errors
             logger.exception("Auth flow error: %s", exc)
+            await self.capture_page_screenshot(
+                page,
+                prefix="LoginError",
+                description=f"Ошибка авторизации: {exc}",
+            )
             return "ERROR"
         finally:
             await page.close()
@@ -389,21 +404,88 @@ class AuthManager:
     async def _submit_credentials(self, page: Page) -> None:
         username = os.getenv("PORTAL_USERNAME")
         password = os.getenv("PORTAL_PASSWORD")
-        try:
-            if username:
-                await page.fill("input[name*='user']", username)
-            if password:
-                await page.fill("input[type='password']", password)
-            await page.click("button[type='submit']")
-        except PlaywrightTimeoutError:
-            logger.warning("Credential fields not found, waiting for manual input")
+
+        async def _fill_first(selectors: list[str], value: str, field: str) -> bool:
+            for selector in selectors:
+                try:
+                    locator = page.locator(selector)
+                    if await locator.count():
+                        await locator.first.fill(value)
+                        logger.info("Filled %s via selector %s", field, selector)
+                        return True
+                except PlaywrightTimeoutError:
+                    continue
+                except Exception as exc:  # pragma: no cover - selector edge cases
+                    logger.debug("Selector %s failed for %s: %s", selector, field, exc)
+                    continue
+            return False
+
+        if username:
+            username_selectors = [
+                "input[name*='user']",
+                "input[name*='login']",
+                "input[id*='user']",
+                "input[id*='login']",
+                "input#username",
+                "input[name='username']",
+            ]
+            if not await _fill_first(username_selectors, username, "username"):
+                logger.warning("Username field not found, expecting manual entry")
+
+        if password:
+            password_selectors = [
+                "input[type='password']",
+                "input[name*='pass']",
+                "input[id*='pass']",
+                "input#password",
+            ]
+            if not await _fill_first(password_selectors, password, "password"):
+                logger.warning("Password field not found, expecting manual entry")
+
+        submit_selectors = [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button:has-text('Prihlásiť')",
+            "button:has-text('Login')",
+        ]
+        submitted = False
+        for selector in submit_selectors:
+            try:
+                locator = page.locator(selector)
+                if await locator.count():
+                    await locator.first.click()
+                    submitted = True
+                    logger.info("Clicked submit via selector %s", selector)
+                    break
+            except PlaywrightTimeoutError:
+                continue
+            except Exception as exc:  # pragma: no cover - selector edge cases
+                logger.debug("Submit selector %s failed: %s", selector, exc)
+                continue
+
+        if not submitted:
+            try:
+                await page.keyboard.press("Enter")
+                logger.info("Triggered form submit via Enter key")
+            except Exception as exc:  # pragma: no cover - keyboard edge cases
+                logger.warning("Unable to submit credentials automatically: %s", exc)
 
     async def _await_sms_prompt(self, page: Page) -> bool:
-        try:
-            await page.wait_for_selector("input[type='tel']", timeout=5000)
-            return True
-        except PlaywrightTimeoutError:
-            return False
+        selectors = [
+            "input[type='tel']",
+            "input[name*='sms']",
+            "input[id*='sms']",
+            "input[name*='otp']",
+            "input[id*='otp']",
+        ]
+        for selector in selectors:
+            try:
+                await page.wait_for_selector(selector, timeout=5000)
+                logger.info("SMS prompt detected via selector %s", selector)
+                return True
+            except PlaywrightTimeoutError:
+                continue
+        return False
 
     async def _prompt_sms_code(self, bot: Bot) -> Optional[str]:
         if not self._owner_id:
@@ -434,8 +516,160 @@ class AuthManager:
         return None
 
     async def _enter_sms_code(self, page: Page, code: str) -> None:
-        await page.fill("input[type='tel']", code)
-        await page.click("button[type='submit']")
+        selectors = [
+            "input[type='tel']",
+            "input[name*='sms']",
+            "input[id*='sms']",
+            "input[name*='otp']",
+            "input[id*='otp']",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                if await locator.count():
+                    await locator.first.fill(code)
+                    logger.info("Filled SMS code using selector %s", selector)
+                    break
+            except Exception as exc:  # pragma: no cover - selector edge cases
+                logger.debug("Failed to fill SMS selector %s: %s", selector, exc)
+        try:
+            submit = page.locator("button[type='submit']")
+            if await submit.count():
+                await submit.first.click()
+            else:
+                await page.keyboard.press("Enter")
+        except Exception as exc:  # pragma: no cover - selector edge cases
+            logger.debug("Failed to submit SMS form: %s", exc)
+
+
+    async def _run_system_checks(self) -> None:
+        warnings = []
+        hint_parts = []
+        timedatectl_path = shutil.which("timedatectl")
+        if not timedatectl_path:
+            warnings.append("нет timedatectl")
+        else:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    timedatectl_path,
+                    "status",
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    await asyncio.wait_for(proc.communicate(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    warnings.append("timedatectl не отвечает")
+                    hint_parts.append("timeout")
+                else:
+                    if proc.returncode != 0:
+                        warnings.append("timedatectl вернул ошибку")
+                        hint_parts.append(f"rc={proc.returncode}")
+            except Exception as exc:  # pragma: no cover - system specific
+                warnings.append("timedatectl не отвечает")
+                hint_parts.append(str(exc))
+
+        if not Path("/etc/ssl/certs/ca-certificates.crt").exists():
+            warnings.append("нет ca-certificates")
+            hint_parts.append("apt install ca-certificates")
+
+        if not Path("/usr/share/zoneinfo").exists():
+            warnings.append("нет tzdata")
+            hint_parts.append("apt install tzdata")
+
+        if warnings:
+            message = "; ".join(warnings)
+            if hint_parts:
+                message = f"{message} ({'; '.join(hint_parts)})"
+            db.settings_set("auth_system_state", "WARN")
+            db.settings_set("auth_system_hint", message)
+        else:
+            db.settings_set("auth_system_state", "OK")
+            db.settings_set("auth_system_hint", "")
+
+    def _build_manual_link(self) -> str:
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        parts = urlsplit(self._login_url)
+        try:
+            from urllib.parse import parse_qsl
+
+            query = dict(parse_qsl(parts.query))
+        except Exception:
+            query = {}
+        query["manual_token"] = timestamp
+        new_query = urlencode(query)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+    async def capture_page_screenshot(
+        self,
+        page: Page,
+        *,
+        prefix: str,
+        description: str,
+    ) -> Optional[str]:
+        try:
+            data = await page.screenshot(full_page=True)
+        except Exception as exc:  # pragma: no cover - playwright edge
+            logger.warning("Failed to capture %s screenshot: %s", prefix, exc)
+            return None
+        return await asyncio.to_thread(self._store_screenshot, data, prefix, description)
+
+    async def _capture_context_screenshot(
+        self,
+        context: BrowserContext,
+        *,
+        prefix: str,
+        description: str,
+    ) -> Optional[str]:
+        page = await context.new_page()
+        try:
+            await page.goto(self._login_url, wait_until="domcontentloaded", timeout=30000)
+            return await self.capture_page_screenshot(page, prefix=prefix, description=description)
+        except Exception as exc:  # pragma: no cover - navigation issues
+            logger.warning("Failed to capture context screenshot: %s", exc)
+            return None
+        finally:
+            await page.close()
+
+    async def capture_portal_error(
+        self,
+        url: str,
+        *,
+        description: str,
+        prefix: str = "PortalError",
+    ) -> Optional[str]:
+        context = await self.get_context()
+        if not context:
+            return None
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:  # pragma: no cover - portal issues
+            logger.warning("Portal error navigation failed: %s", exc)
+        finally:
+            try:
+                path = await self.capture_page_screenshot(
+                    page,
+                    prefix=prefix,
+                    description=description,
+                )
+            finally:
+                await page.close()
+        return path
+
+    def _store_screenshot(self, data: bytes, prefix: str, description: str) -> Optional[str]:
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        name = f"{prefix}_{timestamp}.png"
+        path = self._screen_dir / name
+        try:
+            path.write_bytes(data)
+        except Exception as exc:  # pragma: no cover - filesystem issues
+            logger.error("Failed to persist screenshot %s: %s", name, exc)
+            return None
+        db.record_screenshot(name, str(path), description)
+        logger.info("Screenshot saved: %s", path)
+        return str(path)
 
 
     async def _run_system_checks(self) -> None:
