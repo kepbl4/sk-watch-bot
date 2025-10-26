@@ -547,6 +547,140 @@ class AuthManager:
             except Exception as exc:  # pragma: no cover - keyboard edge cases
                 logger.warning("Unable to submit credentials automatically: %s", exc)
 
+    async def _advance_identity_wizard(self, page: Page) -> None:
+        for _ in range(3):
+            progressed = await self._complete_identity_form(page)
+            if not progressed:
+                break
+            await self.handle_portal_interstitial(page)
+
+    async def _complete_identity_form(self, page: Page) -> bool:
+        if not await self._is_identity_wizard(page):
+            return False
+
+        details = {
+            "Meno": os.getenv("PORTAL_FIRST_NAME", "Ion"),
+            "Priezvisko": os.getenv("PORTAL_LAST_NAME", "Huzo"),
+            "Dátum narodenia": os.getenv("PORTAL_BIRTHDATE", "15.10.2003"),
+            "Číslo cestovného dokladu": os.getenv("PORTAL_PASSPORT", "GB039802"),
+            "SMS kontakt": os.getenv("PORTAL_PHONE", "+421944813597"),
+            "Email kontakt": os.getenv("PORTAL_EMAIL", "mifania0586@gmail.com"),
+        }
+
+        async def _fill_field(label: str, value: str, extra_selectors: list[str]) -> bool:
+            if not value:
+                return False
+            try:
+                locator = page.get_by_label(re.compile(label, re.I))
+                if await locator.count():
+                    await locator.first.fill(value)
+                    logger.info("Filled %s via label", label)
+                    return True
+            except Exception as exc:  # pragma: no cover - selector edge cases
+                logger.debug("Label fill failed for %s: %s", label, exc)
+            for selector in extra_selectors:
+                try:
+                    locator = page.locator(selector)
+                    if await locator.count():
+                        await locator.first.fill(value)
+                        logger.info("Filled %s via selector %s", label, selector)
+                        return True
+                except Exception as exc:  # pragma: no cover - selector edge cases
+                    logger.debug("Selector %s failed for %s: %s", selector, label, exc)
+            logger.warning("Не удалось автоматически заполнить поле %s", label)
+            return False
+
+        field_selectors = {
+            "Meno": [
+                "input[name*='meno']",
+                "input[id*='meno']",
+            ],
+            "Priezvisko": [
+                "input[name*='priez']",
+                "input[id*='priez']",
+            ],
+            "Dátum narodenia": [
+                "input[type='date']",
+                "input[name*='narod']",
+                "input[id*='narod']",
+            ],
+            "Číslo cestovného dokladu": [
+                "input[name*='cest']",
+                "input[name*='passport']",
+                "input[id*='cest']",
+            ],
+            "SMS kontakt": [
+                "input[type='tel']",
+                "input[name*='sms']",
+                "input[id*='sms']",
+                "input[name*='phone']",
+            ],
+            "Email kontakt": [
+                "input[type='email']",
+                "input[name*='mail']",
+                "input[id*='mail']",
+            ],
+        }
+
+        filled_any = False
+        for label, value in details.items():
+            selectors = field_selectors.get(label, [])
+            if await _fill_field(label, value, selectors):
+                filled_any = True
+
+        if not filled_any:
+            logger.debug("Identity wizard detected but no fields filled")
+            return False
+
+        submit_selectors = [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button:has-text('Pokračovať')",
+            "button:has-text('Continue')",
+        ]
+        for selector in submit_selectors:
+            try:
+                locator = page.locator(selector)
+                if await locator.count():
+                    await locator.first.click()
+                    await page.wait_for_load_state("networkidle")
+                    logger.info("Submitted identity wizard via %s", selector)
+                    return True
+            except PlaywrightTimeoutError:
+                continue
+            except Exception as exc:  # pragma: no cover - selector edge cases
+                logger.debug("Submit selector %s failed for identity wizard: %s", selector, exc)
+
+        try:
+            await page.keyboard.press("Enter")
+            await page.wait_for_load_state("networkidle")
+            logger.info("Submitted identity wizard via Enter key")
+            return True
+        except Exception as exc:  # pragma: no cover - keyboard edge cases
+            logger.warning("Не удалось отправить форму идентификации автоматически: %s", exc)
+            return False
+
+    async def _is_identity_wizard(self, page: Page) -> bool:
+        try:
+            if await page.locator("text=/Krok\\s+\\d+\\s+z\\s+/i").count():
+                return True
+            keywords = [
+                "Submission of application",
+                "Všetky aktuálne informácie",
+                "Vyplňte nasledovné údaje",
+                "Enter the name and permanent address",
+            ]
+            for keyword in keywords:
+                if await page.locator(f"text={keyword}").count():
+                    return True
+            if await page.locator("input[name*='meno']").count():
+                return True
+            if await page.locator("input[name*='priez']").count():
+                return True
+        except Exception as exc:  # pragma: no cover - selector edge cases
+            logger.debug("Identity wizard detection failed: %s", exc)
+        return False
+
     async def _await_sms_prompt(self, page: Page) -> bool:
         selectors = [
             "input[type='tel']",
