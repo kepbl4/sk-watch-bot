@@ -761,7 +761,13 @@ async def _edit_message(callback: CallbackQuery, text: str, keyboard: InlineKeyb
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
-    await ensure_summary_message(message)
+    try:
+        await ensure_summary_message(message)
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        logger.exception("Failed to render summary on /start: %s", exc)
+        await message.answer(
+            "Не удалось подготовить сводку. Попробуйте ещё раз позже или обратитесь к администратору."
+        )
 
 
 @router.callback_query(F.data == "summary:refresh")
