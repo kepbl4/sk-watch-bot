@@ -174,6 +174,7 @@ class WatcherScheduler:
         page = await context.new_page()
         try:
             response = await page.goto(url, wait_until="networkidle", timeout=60000)
+            await auth_manager.handle_portal_interstitial(page)
             http_status = response.status if response else None
             page_url = page.url
             await self._wait_for_schedule(page)
@@ -282,6 +283,7 @@ class WatcherScheduler:
         await asyncio.to_thread(db.finish_run, run_id, ok=ok, errors=errors, findings=findings)
 
     async def _wait_for_schedule(self, page: Page) -> None:
+        await auth_manager.handle_portal_interstitial(page)
         await page.wait_for_selector("text=Pracoviská", timeout=30000)
 
     async def _parse_city_rows(self, page: Page) -> List[Tuple[str, Optional[str], str]]:

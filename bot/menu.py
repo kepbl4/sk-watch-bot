@@ -36,6 +36,14 @@ TRACKED_ANCHOR = "tracked"
 ADMIN_ANCHOR = "admin"
 DIAGNOSTIC_ANCHOR = "diagnostics"
 
+ANCHOR_KEYS = (
+    SUMMARY_ANCHOR,
+    CATEGORIES_ANCHOR,
+    TRACKED_ANCHOR,
+    ADMIN_ANCHOR,
+    DIAGNOSTIC_ANCHOR,
+)
+
 STATUS_ICONS = {
     None: "⏸",
     "": "⏸",
@@ -77,6 +85,11 @@ def configure(interval: int, owner_id: Optional[int]) -> None:
 
 async def run_in_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+async def _save_anchor_bundle(chat_id: int, message_id: int) -> None:
+    for anchor in ANCHOR_KEYS:
+        await run_in_thread(db.save_anchor, anchor, chat_id, message_id)
 
 
 async def _read_connectivity_snapshot() -> Dict[str, Any]:
@@ -176,7 +189,6 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                     portal_state = "OK"
                     method_note = "method not allowed"
                 elif status_code in {200, 301, 302}:
-                if status_code in {200, 301, 302}:
                     portal_state = "OK"
                     if elapsed > latency_threshold:
                         portal_state = "SLOW"
@@ -191,7 +203,6 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                     latency_ms=elapsed,
                     http_status=status_code,
                     error=portal_error or method_note,
-                    error=portal_error,
                 )
                 if portal_state == "ERR":
                     logger.warning("Portal sensor error: %s", portal_error)
@@ -200,7 +211,6 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                 )
                 if method_note and not portal_error:
                     portal_error = method_note
-                    )
             except Exception as exc:  # pragma: no cover - network issues
                 portal_state = "ERR"
                 portal_error = str(exc)
@@ -413,41 +423,22 @@ def summary_keyboard(*, sms_pending: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-async def ensure_summary_message(message: Message, *, force_status: bool = False) -> None:
+async def _render_summary(
+    bot,
+    chat_id: int,
+    message_id: int,
+    *,
+    force_status: bool = False,
+    fallback_chat_id: Optional[int] = None,
+) -> None:
     text, sms_pending = await build_summary_text(force_status=force_status)
     keyboard = summary_keyboard(sms_pending=sms_pending)
-    anchor = await run_in_thread(db.get_anchor, SUMMARY_ANCHOR)
-    bot = message.bot
-
-    if anchor and anchor.get("chat_id") == message.chat.id:
-        try:
-            await bot.edit_message_text(
-                text=text,
-                chat_id=anchor["chat_id"],
-                message_id=anchor["message_id"],
-                reply_markup=keyboard,
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        except TelegramBadRequest as exc:
-            logger.warning("Failed to edit summary message: %s", exc)
-
-    sent = await message.answer(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-    await run_in_thread(db.save_anchor, SUMMARY_ANCHOR, message.chat.id, sent.message_id)
-    await run_in_thread(db.save_anchor, CATEGORIES_ANCHOR, message.chat.id, sent.message_id)
-    await run_in_thread(db.save_anchor, TRACKED_ANCHOR, message.chat.id, sent.message_id)
-    await run_in_thread(db.save_anchor, ADMIN_ANCHOR, message.chat.id, sent.message_id)
-    await run_in_thread(db.save_anchor, DIAGNOSTIC_ANCHOR, message.chat.id, sent.message_id)
-
-
-async def edit_summary_message(bot, chat_id: int, message_id: int, *, force_status: bool = False) -> None:
-    text, sms_pending = await build_summary_text(force_status=force_status)
     try:
         await bot.edit_message_text(
             text=text,
             chat_id=chat_id,
             message_id=message_id,
-            reply_markup=summary_keyboard(sms_pending=sms_pending),
+            reply_markup=keyboard,
             parse_mode=ParseMode.HTML,
         )
     except TelegramBadRequest as exc:
@@ -735,25 +726,6 @@ async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text="Логи (100)", callback_data="admin:logs:100"),
         ]
     )
-    if screenshots:
-        for shot in screenshots:
-            created = _format_datetime(shot.get("created_at"), "%d.%m %H:%M:%S")
-            keyboard_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"{created} • {shot.get('name')}",
-                        callback_data=f"admin:screen:{shot.get('name')}",
-                    )
-                ]
-            )
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Последние скрины",
-                    callback_data="admin:screenshots",
-                )
-            ]
-        )
     keyboard_rows.append(
         [InlineKeyboardButton(text="Отчёт об ошибке", callback_data="admin:failure_report")]
     )
@@ -789,7 +761,13 @@ async def _edit_message(callback: CallbackQuery, text: str, keyboard: InlineKeyb
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
-    await ensure_summary_message(message)
+    try:
+        await ensure_summary_message(message)
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        logger.exception("Failed to render summary on /start: %s", exc)
+        await message.answer(
+            "Не удалось подготовить сводку. Попробуйте ещё раз позже или обратитесь к администратору."
+        )
 
 
 @router.callback_query(F.data == "summary:refresh")
