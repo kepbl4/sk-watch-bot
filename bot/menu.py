@@ -142,6 +142,13 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
     connector = aiohttp.TCPConnector(ssl=False) if ignore_https else None
     latency_threshold = int(os.getenv("PORTAL_SLOW_THRESHOLD_MS", "4000") or 4000)
 
+    expected_countries_raw = os.getenv("VPN_EXPECTED_COUNTRY", "SK")
+    expected_countries = {
+        item.strip().upper()
+        for item in expected_countries_raw.split(",")
+        if item.strip()
+    }
+
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         # VPN / geo check
         try:
@@ -153,7 +160,12 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                     data = await resp.json()
                     vpn_country = (data.get("country_iso") or data.get("country_iso_code") or "").upper()
                     vpn_ip = data.get("ip") or ""
-                    vpn_state = "OK" if vpn_country == "SK" else "NEED_VPN"
+                    if expected_countries and vpn_country not in expected_countries:
+                        vpn_state = "NEED_VPN"
+                        if not vpn_error:
+                            vpn_error = f"expected {','.join(sorted(expected_countries))} got {vpn_country or '??'}"
+                    else:
+                        vpn_state = "OK"
                 else:
                     vpn_state = "ERR"
                     vpn_error = f"HTTP {resp.status}"
@@ -899,7 +911,18 @@ async def handle_resume_all(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "summary:vpn")
 async def handle_vpn_status(callback: CallbackQuery) -> None:
-    snapshot = await ensure_connectivity_status(force=True)
+    await callback.answer("Обновляю диагностику…")
+    try:
+        snapshot = await asyncio.wait_for(
+            ensure_connectivity_status(force=True), timeout=6
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Connectivity refresh timed out, using cached snapshot")
+        snapshot = await ensure_connectivity_status(force=False)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.exception("Connectivity refresh failed: %s", exc)
+        snapshot = await _read_connectivity_snapshot()
+
     vpn_line = snapshot.get("vpn_status") or "ERR"
     ip = snapshot.get("vpn_ip") or "—"
     country = snapshot.get("vpn_country_code") or "??"
@@ -908,15 +931,17 @@ async def handle_vpn_status(callback: CallbackQuery) -> None:
     portal_latency = snapshot.get("portal_latency_ms") or "—"
     portal_error = snapshot.get("portal_error") or ""
     lines = [
+        "<b>VPN диагностика</b>",
         f"IP: {ip}",
         f"Страна: {country}",
         f"VPN: {vpn_line} (lat {latency} мс)",
         f"Портал: {portal} (lat {portal_latency} мс)",
     ]
-    if portal_error and portal != "OK":
-        lines.append(portal_error[:60])
-    await refresh_summary(callback.message.bot, force_status=True)
-    await callback.answer("\n".join(lines), show_alert=True)
+    if portal_error and portal.startswith("ERR"):
+        lines.append(f"Ошибка: {portal_error[:120]}")
+
+    await callback.message.answer("\n".join(lines))
+    await refresh_summary(callback.message.bot)
 
 
 @router.callback_query(F.data == CAPTCHA_READY)

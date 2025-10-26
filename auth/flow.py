@@ -120,8 +120,18 @@ class AuthManager:
             url = category.get("url") or self._login_url
             page = await context.new_page()
             try:
-                await page.goto(url, wait_until="networkidle", timeout=45000)
-                await asyncio.sleep(1)
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                await self.handle_portal_interstitial(page)
+                await self._advance_identity_wizard(page)
+                try:
+                    await page.wait_for_load_state("networkidle")
+                except PlaywrightTimeoutError:
+                    logger.debug("Screenshot networkidle wait timed out")
+                try:
+                    await page.wait_for_selector("text=Pracoviská", timeout=5000)
+                except PlaywrightTimeoutError:
+                    logger.debug("Screenshot did not detect schedule marker")
+                await asyncio.sleep(0.5)
                 data = await page.screenshot(full_page=True)
                 filename = f"{cat_key}.png"
                 await asyncio.to_thread(
