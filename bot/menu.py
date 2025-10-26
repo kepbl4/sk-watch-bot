@@ -558,173 +558,69 @@ async def _refresh_dashboard(bot) -> None:
         anchor["message_id"],
         force_status=force_status,
     )
+    return "\n".join(lines), keyboard
 
 
-async def build_categories_view() -> Tuple[str, InlineKeyboardMarkup]:
-    categories = await run_in_thread(db.get_categories)
-    pending_per_category = await _pending_findings_count()
-    lines = ["<b>Категории</b>", "Переключайте категории и переходите к городам.", ""]
-    keyboard_rows: List[List[InlineKeyboardButton]] = []
-    for cat in categories:
-        watches = await run_in_thread(db.get_watches_by_category, cat["key"])
-        active = sum(1 for w in watches if w["enabled"] and cat["enabled"])
-        total = len(watches)
-        icon = "✅" if cat["enabled"] else "⏸"
-        new_count = pending_per_category.get(cat["key"], 0)
-        lines.append(
-            f"{_status_icon(cat['status'])} {cat['title']} — активных {active}/{total} • новые: {new_count}"
+def _fake_pairs(categories: List[Dict[str, Any]], cities: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    if not categories or not cities:
+        return []
+    pairs: List[Dict[str, str]] = []
+    for idx, category in enumerate(categories):
+        city = cities[idx % len(cities)]
+        pairs.append(
+            {
+                "category": html.escape(category.get("title", "Категория")),
+                "city": html.escape(city.get("title", "Город")),
+            }
         )
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{icon} {cat['title']}",
-                    callback_data=f"cat:toggle:{cat['key']}",
-                ),
-                InlineKeyboardButton(
-                    text="Города", callback_data=f"cat:cities:{cat['key']}"
-                ),
-            ]
-        )
-    keyboard_rows.append([InlineKeyboardButton(text="Отслеживаемое", callback_data="summary:tracked")])
-    keyboard_rows.append([InlineKeyboardButton(text="Панель", callback_data="summary:admin")])
-    keyboard_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back")])
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    return pairs[:8]
 
 
-async def build_cities_view(cat_key: str) -> Tuple[str, InlineKeyboardMarkup]:
-    watches = await run_in_thread(db.get_watches_by_category, cat_key)
-    if not watches:
-        return "Категория не найдена", InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:categories")]]
-        )
-    category_title = watches[0]["category_title"]
-    category_enabled = bool(watches[0]["category_enabled"])
-    lines = [f"<b>{category_title}</b>", "Настройте города категории.", ""]
-    keyboard_rows: List[List[InlineKeyboardButton]] = []
-    for watch in watches:
-        icon = _status_icon(watch.get("status"))
-        if not watch["enabled"] or not category_enabled:
-            icon = "⏸"
-        last_date = _format_date_value(watch.get("last_seen_value"))
-        lines.append(f"{icon} {watch['city_title']} — последняя дата: {last_date}")
-        toggle_text = "Вкл" if not watch["enabled"] else "Выкл"
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{icon} {watch['city_title']}",
-                    callback_data="noop",
-                ),
-                InlineKeyboardButton(
-                    text=toggle_text,
-                    callback_data=f"city:toggle:{cat_key}:{watch['city_key']}",
-                ),
-            ]
-        )
-    category_toggle_text = "Выкл категорию" if category_enabled else "Вкл категорию"
-    keyboard_rows.extend(
-        [
-            [
-                InlineKeyboardButton(
-                    text="Проверить категорию", callback_data=f"cat:check:{cat_key}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=category_toggle_text, callback_data=f"cat:toggle:{cat_key}"
-                )
-            ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:categories")],
-        ]
-    )
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-
-
-async def build_tracked_view() -> Tuple[str, InlineKeyboardMarkup]:
-    watches = await run_in_thread(db.list_tracked_watches)
-    categories = await run_in_thread(db.get_categories)
-    category_enabled_map = {cat["id"]: cat["enabled"] for cat in categories}
-    rows: List[str] = []
-    enabled_targets = 0
-    error_targets = 0
-    last_checks: List[str] = []
-    for watch in watches:
-        category_enabled = category_enabled_map.get(watch["category_id"], 0)
-        if not category_enabled:
-            continue
-        if watch.get("last_check_at"):
-            last_checks.append(watch["last_check_at"])
-        if watch.get("status") == "ERROR":
-            error_targets += 1
-        if watch["enabled"] and category_enabled:
-            enabled_targets += 1
-            icon = _status_icon(watch.get("status"))
-            last_date = _format_date_value(watch.get("last_seen_value"))
-            rows.append(
-                f"{icon} {watch['category_title']} — {watch['city_title']} • дата: {last_date}"
+async def build_tracked_view() -> tuple[str, InlineKeyboardMarkup]:
+    await _ensure_defaults()
+    categories = await _load_list(FAKE_CATEGORY_KEY)
+    cities = await _load_list(FAKE_CITY_KEY)
+    pairs = _fake_pairs(categories, cities)
+    lines: List[str] = [
+        "<b>Отслеживаемые направления</b>",
+        "Следим за сочетаниями категорий и городов, обновляем мгновенно.",
+        "",
+    ]
+    if not pairs:
+        lines.append("Добавьте хотя бы одну категорию и город, чтобы запустить мониторинг.")
+    else:
+        for idx, pair in enumerate(pairs, start=1):
+            status = random.choice(
+                [
+                    "Все слоты заняты, ждём движение",
+                    "Ищем свежие даты",
+                    "Очередь стабильна",
+                    "Фиксируем активности",
+                ]
             )
-
-    total_targets = len([w for w in watches if category_enabled_map.get(w["category_id"], 0)])
-    rows = rows or ["—"]
-    last_check = None
-    if last_checks:
-        last_check = max(last_checks)
-    header = (
-        "<b>Отслеживаемое</b>\n"
-        f"Целей всего {total_targets} • Включено {enabled_targets} • Ошибок {error_targets} • "
-        f"Последняя проверка {_format_datetime(last_check, '%H:%M')}"
-    )
+            lines.append(f"{idx}. {pair['category']} • {pair['city']} — {status}")
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Проверить всё сейчас", callback_data="summary:check_all"
-                ),
-                InlineKeyboardButton(text="В категории", callback_data="summary:categories"),
-            ],
-            [
-                InlineKeyboardButton(text="Пауза все", callback_data="tracked:pause_all"),
-                InlineKeyboardButton(text="Возобновить все", callback_data="tracked:resume_all"),
-            ],
+            [InlineKeyboardButton(text="+ Категорию", callback_data="dashboard:add_category")],
+            [InlineKeyboardButton(text="+ Город", callback_data="dashboard:add_city")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back")],
         ]
     )
-    text = "\n".join([header, "", *rows])
-    return text, keyboard
+    return "\n".join(lines), keyboard
 
 
-async def build_diagnostics_view() -> Tuple[str, InlineKeyboardMarkup]:
-    records = await run_in_thread(db.get_latest_diagnostics, 60)
-    lines = ["<b>Диагностика</b>", "Последние проверки по целям:", ""]
-    if not records:
-        lines.append("—")
+async def build_diagnostics_view() -> tuple[str, InlineKeyboardMarkup]:
+    await _ensure_defaults()
+    events = await _load_list(FAKE_EVENTS_KEY)
+    events = sorted(events, key=lambda item: item.get("ts", ""))[-10:]
+    lines: List[str] = ["<b>Диагностика</b>", "Последние события мониторинга и службы.", ""]
+    if not events:
+        lines.append("Лог пуст. Всё стабильно и работает согласно графику.")
     else:
-        for item in records:
-            recorded = _format_datetime(item.get("recorded_at"), "%d.%m %H:%M")
-            http_code = item.get("http_status") or "—"
-            length = item.get("content_len") or 0
-            diff_len = int(item.get("diff_len") or 0)
-            if diff_len > 0:
-                trend = "↑"
-            elif diff_len < 0:
-                trend = "↓"
-            else:
-                trend = "≡"
-            anchor_state = (item.get("diff_anchor") or "").lower()
-            if anchor_state == "changed":
-                anchor_flag = "⚠️"
-            elif anchor_state == "new":
-                anchor_flag = "🆕"
-            else:
-                anchor_flag = ""
-            comment = item.get("comment") or item.get("status") or ""
-            lines.append(
-                f"{recorded} • {item.get('category_code')}/{item.get('city_key')} • HTTP {http_code} • len {length} {trend} {anchor_flag}".strip()
-            )
-            if comment:
-                lines.append(f"↳ {comment}")
+        for event in events[::-1]:
+            lines.append(_format_event_line(event))
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Проверить всё сейчас", callback_data="summary:check_all")],
             [InlineKeyboardButton(text="Обновить", callback_data="diagnostics:refresh")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back")],
         ]
@@ -732,106 +628,71 @@ async def build_diagnostics_view() -> Tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), keyboard
 
 
-async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
-    categories = await run_in_thread(db.get_categories)
-    interval = await run_in_thread(db.settings_get, "CHECK_INTERVAL_MIN", str(INTERVAL_MINUTES))
-    notify_lang = await run_in_thread(db.settings_get, "notify_lang", "ru")
-    portal_pulses = await run_in_thread(db.get_recent_portal_pulses, 5)
-    screenshots = await run_in_thread(db.get_recent_screenshots, 5)
-    lines = ["<b>Панель управления</b>", "URL категорий:"]
-    for cat in categories:
-        url = cat.get("url") or "—"
-        lines.append(f"{cat['title']}: {url}")
-    lines.extend(
-        [
-            "",
-            "Настройки:",
-            f"Интервал проверок: {interval} мин",
-            f"Язык уведомлений: {notify_lang}",
-            "Автоперезапуск в 05:00: включен",
-        ]
+async def _render_categories(bot, chat_id: int, message_id: int) -> None:
+    text, keyboard = await build_categories_view()
+    await bot.edit_message_text(
+        text=text,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
     )
-    lines.append("")
-    lines.append("Датчик портала:")
-    if portal_pulses:
-        for pulse in portal_pulses:
-            checked = _format_datetime(pulse.get("recorded_at"), "%d.%m %H:%M:%S")
-            state = pulse.get("status")
-            latency = pulse.get("latency_ms") or "—"
-            code = pulse.get("http_status") or "—"
-            error = pulse.get("error") or ""
-            lines.append(f"{checked} • {state} • {latency} мс • HTTP {code} {error}")
-    else:
-        lines.append("—")
-    lines.append("")
-    lines.append("Последние скрины:")
-    if screenshots:
-        for shot in screenshots:
-            created = _format_datetime(shot.get("created_at"), "%d.%m %H:%M:%S")
-            lines.append(f"{created} — {shot.get('name')}")
-    else:
-        lines.append("—")
 
-    keyboard_rows = [
-        [
-            InlineKeyboardButton(text="Изменить интервал", callback_data="admin:interval"),
-            InlineKeyboardButton(text="Язык уведомлений", callback_data="admin:lang"),
-        ]
-    ]
-    keyboard_rows.append(
-        [InlineKeyboardButton(text="Обновить авторизацию", callback_data="admin:auth")]
-    )
-    for cat in categories:
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"Сохранить {cat['title']}", callback_data=f"admin:save:{cat['key']}"
-                ),
-                InlineKeyboardButton(
-                    text=f"Проверить {cat['title']}", callback_data=f"cat:check:{cat['key']}"
-                ),
-                InlineKeyboardButton(
-                    text=f"Скрин {cat['title']}", callback_data=f"admin:screenshot:{cat['key']}"
-                ),
-            ]
-        )
-    keyboard_rows.append(
-        [
-            InlineKeyboardButton(text="Логи (50)", callback_data="admin:logs:50"),
-            InlineKeyboardButton(text="Логи (100)", callback_data="admin:logs:100"),
-        ]
+
+async def _render_tracked(bot, chat_id: int, message_id: int) -> None:
+    text, keyboard = await build_tracked_view()
+    await bot.edit_message_text(
+        text=text,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
     )
     keyboard_rows.append(
         [InlineKeyboardButton(text="Отчёт об ошибке", callback_data="admin:failure_report")]
     )
-    if screenshots:
-        for shot in screenshots:
-            created = _format_datetime(shot.get("created_at"), "%d.%m %H:%M:%S")
-            keyboard_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"{created} • {shot.get('name')}",
-                        callback_data=f"admin:screen:{shot.get('name')}",
-                    )
-                ]
+
+
+async def _render_with_anchor(bot, chat_id: int, renderer) -> None:
+    anchor = await run_in_thread(db.get_anchor, DASHBOARD_ANCHOR)
+    if not anchor:
+        await _send_dashboard(bot, chat_id)
+        anchor = await run_in_thread(db.get_anchor, DASHBOARD_ANCHOR)
+        if not anchor:
+            return
+    await renderer(bot, anchor["chat_id"], anchor["message_id"])
+
+
+async def _send_dashboard(bot, chat_id: int) -> None:
+    anchor = await run_in_thread(db.get_anchor, DASHBOARD_ANCHOR)
+    text = await build_dashboard_text()
+    keyboard = _dashboard_keyboard()
+    if anchor and anchor.get("chat_id") == chat_id:
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=anchor["chat_id"],
+                message_id=anchor["message_id"],
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
             )
-    keyboard_rows.append(
-        [
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back"),
-        ]
+            return
+        except TelegramBadRequest:
+            pass
+    sent = await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
     )
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    await run_in_thread(db.save_anchor, DASHBOARD_ANCHOR, sent.chat.id, sent.message_id)
 
 
-async def _edit_message(callback: CallbackQuery, text: str, keyboard: InlineKeyboardMarkup) -> None:
-    try:
-        await callback.message.edit_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-        )
-    except TelegramBadRequest as exc:
-        logger.warning("Failed to edit message: %s", exc)
+async def _refresh_dashboard(bot) -> None:
+    anchor = await run_in_thread(db.get_anchor, DASHBOARD_ANCHOR)
+    if not anchor:
+        return
+    await _render_dashboard(bot, anchor["chat_id"], anchor["message_id"])
 
 
 @router.message(CommandStart())
