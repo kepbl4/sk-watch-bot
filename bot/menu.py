@@ -21,17 +21,42 @@ from watcher.scheduler import scheduler
 
 router = Router(name="menu")
 
-DASHBOARD_ANCHOR = "fake:dashboard"
-FAKE_CATEGORY_KEY = "fake:categories"
-FAKE_CITY_KEY = "fake:cities"
-FAKE_EVENTS_KEY = "fake:events"
-FAKE_VPN_KEY = "fake:vpn_snapshot"
-FAKE_PORTAL_KEY = "fake:portal_snapshot"
-FAKE_LAST_TICK_KEY = "fake:last_tick"
-FAKE_MONITOR_INTERVAL_KEY = "fake:monitor_interval"
-FAKE_AUTH_STATE_KEY = "fake:auth_state"
-FAKE_AUTH_UPDATED_KEY = "fake:last_auth"
-FAKE_AUTH_REASON_KEY = "fake:last_auth_reason"
+SUMMARY_ANCHOR = "summary"
+CATEGORIES_ANCHOR = "categories"
+TRACKED_ANCHOR = "tracked"
+ADMIN_ANCHOR = "admin"
+DIAGNOSTIC_ANCHOR = "diagnostics"
+
+ANCHOR_KEYS = (
+    SUMMARY_ANCHOR,
+    CATEGORIES_ANCHOR,
+    TRACKED_ANCHOR,
+    ADMIN_ANCHOR,
+    DIAGNOSTIC_ANCHOR,
+)
+
+STATUS_ICONS = {
+    None: "⏸",
+    "": "⏸",
+    "PAUSED": "⏸",
+    "IDLE": "⏸",
+    "OK": "✅",
+    "NO_DATE": "⭕",
+    "ERROR": "⚠️",
+    "NEED_AUTH": "🔒",
+    "NEED_VPN": "🌐",
+    "SLOW": "🟡",
+}
+
+AUTH_STATUS_ICONS = {
+    "OK": "✅",
+    "NEED_AUTH": "🔒",
+    "NEED_VPN": "🌐",
+    "NEED_CAPTCHA": "🧩",
+    "NEED_SMS": "🔒",
+    "ERROR": "⚠️",
+    "WARN": "⚠️",
+}
 
 INTERVAL_MINUTES = 10
 OWNER_ID: Optional[int] = None
@@ -70,66 +95,157 @@ async def run_in_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
-async def _ensure_defaults() -> None:
-    for key in (FAKE_CATEGORY_KEY, FAKE_CITY_KEY, FAKE_EVENTS_KEY):
-        raw = await run_in_thread(db.settings_get, key, None)
-        if raw is None:
-            await run_in_thread(db.settings_set, key, "[]")
-    if await run_in_thread(db.settings_get, FAKE_VPN_KEY, None) is None:
-        snapshot = _generate_vpn_snapshot()
-        await run_in_thread(db.settings_set, FAKE_VPN_KEY, json.dumps(snapshot, ensure_ascii=False))
-    if await run_in_thread(db.settings_get, FAKE_PORTAL_KEY, None) is None:
-        snapshot = _generate_portal_snapshot()
-        await run_in_thread(db.settings_set, FAKE_PORTAL_KEY, json.dumps(snapshot, ensure_ascii=False))
-    if await run_in_thread(db.settings_get, FAKE_MONITOR_INTERVAL_KEY, None) is None:
-        await run_in_thread(db.settings_set, FAKE_MONITOR_INTERVAL_KEY, str(INTERVAL_MINUTES))
-    if await run_in_thread(db.settings_get, FAKE_AUTH_STATE_KEY, None) is None:
-        now = datetime.utcnow().isoformat()
-        await run_in_thread(db.settings_set, FAKE_AUTH_STATE_KEY, "OK")
-        await run_in_thread(db.settings_set, FAKE_AUTH_UPDATED_KEY, now)
-        await run_in_thread(db.settings_set, FAKE_AUTH_REASON_KEY, "Инициализация сеанса")
+async def _save_anchor_bundle(chat_id: int, message_id: int) -> None:
+    for anchor in ANCHOR_KEYS:
+        await run_in_thread(db.save_anchor, anchor, chat_id, message_id)
 
 
-def _generate_vpn_snapshot() -> Dict[str, Any]:
-    rng = random.Random()
-    ip = f"185.{rng.randint(10, 220)}.{rng.randint(0, 255)}.{rng.randint(0, 255)}"
-    providers = ["SecureLine", "NordSecure", "ShieldNet", "AtlasSafe"]
-    countries = ["SK", "SK", "SK", "CZ"]
-    latency = rng.randint(60, 170)
-    return {
-        "ip": ip,
-        "provider": rng.choice(providers),
-        "country": rng.choice(countries),
-        "latency": latency,
-        "checked_at": datetime.utcnow().isoformat(),
-    }
-
-
-def _generate_portal_snapshot() -> Dict[str, Any]:
-    rng = random.Random()
-    return {
-        "http_status": 200,
-        "latency": rng.randint(120, 380),
-        "checked_at": datetime.utcnow().isoformat(),
-        "note": "Портал отвечает штатно",
-    }
-
-
-async def _load_list(key: str) -> List[Dict[str, Any]]:
-    raw = await run_in_thread(db.settings_get, key, "[]")
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("Сломанные данные в %s, сбрасываю", key)
-        data = []
-    if not isinstance(data, list):
-        return []
-    return data
+async def _read_connectivity_snapshot() -> Dict[str, Any]:
+    keys = [
+        "vpn_state",
+        "vpn_country_code",
+        "vpn_ip",
+        "vpn_latency_ms",
+        "vpn_error",
+        "portal_state",
+        "portal_code",
+        "portal_latency_ms",
+        "portal_error",
+        "connectivity_checked_at",
+        "vpn_status",
+        "portal_status",
+    ]
+    result: Dict[str, Any] = {}
+    for key in keys:
+        result[key] = await run_in_thread(db.settings_get, key, "")
+    return result
 
 
 async def _save_list(key: str, data: List[Dict[str, Any]]) -> None:
     await run_in_thread(db.settings_set, key, json.dumps(data, ensure_ascii=False))
 
+    vpn_state = "ERR"
+    vpn_country = ""
+    vpn_ip = ""
+    vpn_latency = ""
+    vpn_error = ""
+    portal_state = "ERR"
+    portal_code = ""
+    portal_latency = ""
+    portal_error = ""
+    portal_status = "ERR ⚠️"
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    headers = {"User-Agent": "sk-watch-bot/1.0", "Accept": "application/json"}
+    login_url = os.getenv("LOGIN_URL", "")
+    ignore_https = os.getenv("IGNORE_HTTPS_ERRORS", "false").lower() == "true"
+    connector = aiohttp.TCPConnector(ssl=False) if ignore_https else None
+    latency_threshold = int(os.getenv("PORTAL_SLOW_THRESHOLD_MS", "4000") or 4000)
+
+    expected_countries_raw = os.getenv("VPN_EXPECTED_COUNTRY", "SK")
+    expected_countries = {
+        item.strip().upper()
+        for item in expected_countries_raw.split(",")
+        if item.strip()
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        # VPN / geo check
+        try:
+            start = time.monotonic()
+            async with session.get("https://ifconfig.co/json", headers=headers) as resp:
+                elapsed = int((time.monotonic() - start) * 1000)
+                vpn_latency = str(elapsed)
+                if resp.status == 200:
+                    data = await resp.json()
+                    vpn_country = (data.get("country_iso") or data.get("country_iso_code") or "").upper()
+                    vpn_ip = data.get("ip") or ""
+                    if expected_countries and vpn_country not in expected_countries:
+                        vpn_state = "NEED_VPN"
+                        if not vpn_error:
+                            vpn_error = f"expected {','.join(sorted(expected_countries))} got {vpn_country or '??'}"
+                    else:
+                        vpn_state = "OK"
+                else:
+                    vpn_state = "ERR"
+                    vpn_error = f"HTTP {resp.status}"
+        except Exception as exc:  # pragma: no cover - network issues
+            vpn_state = "ERR"
+            vpn_error = str(exc)
+
+        # Portal availability
+        if login_url:
+            try:
+                start = time.monotonic()
+                status_code = None
+                elapsed = 0
+                try:
+                    async with session.head(login_url, allow_redirects=False) as resp:
+                        status_code = resp.status
+                        elapsed = int((time.monotonic() - start) * 1000)
+                except Exception:
+                    status_code = None
+
+                if status_code == 405:
+                    logger.debug("Portal HEAD returned 405, retrying with GET")
+                if status_code == 405 or status_code is None:
+                    start = time.monotonic()
+                    async with session.get(login_url, allow_redirects=False) as resp:
+                        status_code = resp.status
+                        await resp.read()
+                        elapsed = int((time.monotonic() - start) * 1000)
+                portal_latency = str(elapsed)
+                portal_code = str(status_code)
+                method_note = None
+                if status_code == 405:
+                    portal_state = "OK"
+                    method_note = "method not allowed"
+                elif status_code in {200, 301, 302}:
+                    portal_state = "OK"
+                    if elapsed > latency_threshold:
+                        portal_state = "SLOW"
+                        portal_error = f"latency {elapsed} ms"
+                else:
+                    portal_state = "ERR"
+                    portal_error = f"HTTP {status_code}"
+                await asyncio.to_thread(
+                    db.record_portal_pulse,
+                    recorded_at=datetime.utcnow().isoformat(),
+                    status=portal_state,
+                    latency_ms=elapsed,
+                    http_status=status_code,
+                    error=portal_error or method_note,
+                )
+                if portal_state == "ERR":
+                    logger.warning("Portal sensor error: %s", portal_error)
+                    await auth_manager.capture_portal_error(
+                        login_url, description=portal_error or "portal error"
+                )
+                if method_note and not portal_error:
+                    portal_error = method_note
+            except Exception as exc:  # pragma: no cover - network issues
+                portal_state = "ERR"
+                portal_error = str(exc)
+                await asyncio.to_thread(
+                    db.record_portal_pulse,
+                    recorded_at=datetime.utcnow().isoformat(),
+                    status=portal_state,
+                    latency_ms=None,
+                    http_status=None,
+                    error=portal_error,
+                )
+                await auth_manager.capture_portal_error(login_url or "about:blank", description=portal_error)
+        else:
+            portal_state = "ERR"
+            portal_error = "LOGIN_URL not configured"
+            await asyncio.to_thread(
+                db.record_portal_pulse,
+                recorded_at=datetime.utcnow().isoformat(),
+                status=portal_state,
+                latency_ms=None,
+                http_status=None,
+                error=portal_error,
+            )
 
 async def _append_event(text: str) -> None:
     await scheduler.record_pulse(text)
@@ -221,6 +337,10 @@ async def _ensure_auto_event() -> None:
         await _touch_portal_snapshot()
         await _touch_vpn_snapshot()
 
+    lines = [
+        "<b>🤖 SK Watch Bot · Панель мониторинга</b>",
+        "",
+    ]
 
 async def _touch_vpn_snapshot(update_latency: bool = False) -> Dict[str, Any]:
     raw = await run_in_thread(db.settings_get, FAKE_VPN_KEY, None)
@@ -238,6 +358,19 @@ async def _touch_vpn_snapshot(update_latency: bool = False) -> Dict[str, Any]:
     await run_in_thread(db.settings_set, FAKE_VPN_KEY, json.dumps(snapshot, ensure_ascii=False))
     return snapshot
 
+    lines.append(
+        f"🌐 VPN: ✅ {html.escape(vpn_data.get('country', 'SK'))} • IP {vpn_data.get('ip', '—')} "
+        f"• пинг {vpn_data.get('latency', 0)} мс • {_format_relative(vpn_data.get('checked_at'))}"
+    )
+    lines.append(
+        f"🛰 Портал: ✅ HTTP {portal_data.get('http_status', 200)} • {portal_data.get('latency', 0)} мс "
+        f"• {_format_relative(portal_data.get('checked_at'))}"
+    )
+    total_targets = len(categories) + len(cities)
+    lines.append(
+        f"📡 Мониторинг: {total_targets} направлений • обновление каждые {monitor_interval} мин"
+    )
+    lines.append("")
 
 async def _touch_portal_snapshot() -> Dict[str, Any]:
     raw = await run_in_thread(db.settings_get, FAKE_PORTAL_KEY, None)
@@ -346,28 +479,36 @@ async def build_dashboard_text() -> str:
 
 def _dashboard_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton(text="Обновить", callback_data="summary:refresh")],
         [
-            InlineKeyboardButton(text="Категории", callback_data="summary:categories"),
-            InlineKeyboardButton(text="Диагностика", callback_data="summary:diagnostics"),
+            InlineKeyboardButton(text="+ Категорию", callback_data="dashboard:add_category"),
+            InlineKeyboardButton(text="+ Город", callback_data="dashboard:add_city"),
         ],
-        [InlineKeyboardButton(text="Отслеживаемое", callback_data="summary:tracked")],
         [InlineKeyboardButton(text="Обновить авторизацию", callback_data="dashboard:refresh_auth")],
-        [InlineKeyboardButton(text="Статус VPN", callback_data="summary:vpn")],
+        [
+            InlineKeyboardButton(text="Статус VPN", callback_data="dashboard:vpn"),
+            InlineKeyboardButton(text="Обновить панель", callback_data="dashboard:refresh"),
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-async def _render_dashboard(bot, chat_id: int, message_id: int) -> None:
-    text = await build_dashboard_text()
-    keyboard = _dashboard_keyboard()
+async def _render_summary(
+    bot,
+    chat_id: int,
+    message_id: int,
+    *,
+    force_status: bool = False,
+    fallback_chat_id: Optional[int] = None,
+) -> None:
+    text, sms_pending = await build_summary_text(force_status=force_status)
+    keyboard = summary_keyboard(sms_pending=sms_pending)
     try:
         await bot.edit_message_text(
             text=text,
             chat_id=chat_id,
             message_id=message_id,
             reply_markup=keyboard,
-            disable_web_page_preview=True,
+            parse_mode=ParseMode.HTML,
         )
     except TelegramBadRequest as exc:
         if "message is not modified" in str(exc).lower():
@@ -382,24 +523,40 @@ async def _render_dashboard(bot, chat_id: int, message_id: int) -> None:
         await run_in_thread(db.save_anchor, DASHBOARD_ANCHOR, sent.chat.id, sent.message_id)
 
 
-async def build_categories_view() -> tuple[str, InlineKeyboardMarkup]:
-    await _ensure_defaults()
-    categories = await _load_list(FAKE_CATEGORY_KEY)
-    lines: List[str] = ["<b>Категории</b>", "Управляйте списком направлений для мониторинга.", ""]
-    if not categories:
-        lines.append("Пока ничего нет. Добавьте первую категорию кнопкой ниже.")
-    for idx, entry in enumerate(categories, start=1):
-        title = html.escape(entry.get("title", f"Категория #{idx}"))
-        url = html.escape(entry.get("url", ""))
-        status = _status_for("category", entry.get("url", ""))
-        lines.append(
-            f"{idx}. <a href=\"{url}\">{title}</a> — {status} • {_format_relative(entry.get('created_at'))}"
-        )
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="+ Категорию", callback_data="dashboard:add_category")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="summary:back")],
-        ]
+async def _send_dashboard(bot, chat_id: int) -> None:
+    anchor = await run_in_thread(db.get_anchor, DASHBOARD_ANCHOR)
+    text = await build_dashboard_text()
+    keyboard = _dashboard_keyboard()
+    if anchor and anchor.get("chat_id") == chat_id:
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=anchor["chat_id"],
+                message_id=anchor["message_id"],
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return
+        except TelegramBadRequest:
+            pass
+    sent = await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+    await run_in_thread(db.save_anchor, DASHBOARD_ANCHOR, sent.chat.id, sent.message_id)
+
+
+async def _refresh_dashboard(bot) -> None:
+    anchor = await run_in_thread(db.get_anchor, DASHBOARD_ANCHOR)
+    if not anchor:
+        return
+    await _render_summary(
+        bot,
+        anchor["chat_id"],
+        anchor["message_id"],
+        force_status=force_status,
     )
     return "\n".join(lines), keyboard
 
@@ -491,16 +648,8 @@ async def _render_tracked(bot, chat_id: int, message_id: int) -> None:
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
-
-
-async def _render_diagnostics(bot, chat_id: int, message_id: int) -> None:
-    text, keyboard = await build_diagnostics_view()
-    await bot.edit_message_text(
-        text=text,
-        chat_id=chat_id,
-        message_id=message_id,
-        reply_markup=keyboard,
-        disable_web_page_preview=True,
+    keyboard_rows.append(
+        [InlineKeyboardButton(text="Отчёт об ошибке", callback_data="admin:failure_report")]
     )
 
 
@@ -548,7 +697,14 @@ async def _refresh_dashboard(bot) -> None:
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
-    await _send_dashboard(message.bot, message.chat.id)
+    try:
+        await ensure_summary_message(message)
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        logger.exception("Failed to render summary on /start: %s", exc)
+        await message.answer(
+            "Не удалось подготовить сводку. Попробуйте ещё раз позже или обратитесь к администратору."
+        )
+
 
 
 @router.callback_query(F.data == "dashboard:add_category")
@@ -588,56 +744,126 @@ async def handle_refresh_auth(callback: CallbackQuery) -> None:
     asyncio.create_task(_complete())
 
 
-@router.callback_query(F.data == "summary:refresh")
-async def handle_summary_refresh(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "dashboard:refresh")
+async def handle_refresh(callback: CallbackQuery) -> None:
     await _append_event("Ручное обновление панели — изменений не обнаружено")
-    await _render_with_anchor(callback.message.bot, callback.message.chat.id, _render_dashboard)
+    await _refresh_dashboard(callback.message.bot)
     await callback.answer("Панель обновлена")
 
 
-@router.callback_query(F.data == "summary:categories")
-async def handle_summary_categories(callback: CallbackQuery) -> None:
-    await _append_event("Открыт раздел категорий")
-    await _render_with_anchor(callback.message.bot, callback.message.chat.id, _render_categories)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "summary:tracked")
-async def handle_summary_tracked(callback: CallbackQuery) -> None:
-    await _append_event("Показаны отслеживаемые направления")
-    await _render_with_anchor(callback.message.bot, callback.message.chat.id, _render_tracked)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "summary:diagnostics")
-async def handle_summary_diagnostics(callback: CallbackQuery) -> None:
-    await _append_event("Открыта диагностика мониторинга")
-    await _render_with_anchor(callback.message.bot, callback.message.chat.id, _render_diagnostics)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "diagnostics:refresh")
-async def handle_diagnostics_refresh(callback: CallbackQuery) -> None:
-    await _append_event("Обновлена диагностика")
-    await _render_with_anchor(callback.message.bot, callback.message.chat.id, _render_diagnostics)
-    await callback.answer("Обновлено")
-
-
-@router.callback_query(F.data == "summary:back")
-async def handle_summary_back(callback: CallbackQuery) -> None:
-    await _render_with_anchor(callback.message.bot, callback.message.chat.id, _render_dashboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "summary:vpn")
+@router.callback_query(F.data == "dashboard:vpn")
 async def handle_vpn_status(callback: CallbackQuery) -> None:
-    snapshot = await _touch_vpn_snapshot(update_latency=True)
-    text = (
-        "VPN-туннель активен.\n"
-        f"IP: {snapshot['ip']} ({snapshot['country']})\n"
-        f"Провайдер: {snapshot['provider']}\n"
-        f"Задержка: {snapshot['latency']} мс\n"
-        "Соединение стабильно, мониторинг продолжает работу."
+    await callback.answer("Обновляю диагностику…")
+    try:
+        snapshot = await asyncio.wait_for(
+            ensure_connectivity_status(force=True), timeout=6
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Connectivity refresh timed out, using cached snapshot")
+        snapshot = await ensure_connectivity_status(force=False)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.exception("Connectivity refresh failed: %s", exc)
+        snapshot = await _read_connectivity_snapshot()
+
+    vpn_line = snapshot.get("vpn_status") or "ERR"
+    ip = snapshot.get("vpn_ip") or "—"
+    country = snapshot.get("vpn_country_code") or "??"
+    latency = snapshot.get("vpn_latency_ms") or "—"
+    portal = snapshot.get("portal_status") or "ERR"
+    portal_latency = snapshot.get("portal_latency_ms") or "—"
+    portal_error = snapshot.get("portal_error") or ""
+    lines = [
+        "<b>VPN диагностика</b>",
+        f"IP: {ip}",
+        f"Страна: {country}",
+        f"VPN: {vpn_line} (lat {latency} мс)",
+        f"Портал: {portal} (lat {portal_latency} мс)",
+    ]
+    if portal_error and portal.startswith("ERR"):
+        lines.append(f"Ошибка: {portal_error[:120]}")
+
+    await callback.message.answer("\n".join(lines))
+    await refresh_summary(callback.message.bot)
+
+
+@router.callback_query(F.data == CAPTCHA_READY)
+async def handle_captcha_ready(callback: CallbackQuery) -> None:
+    await auth_manager.resolve_captcha(True)
+    await callback.answer("Продолжаем")
+
+
+@router.callback_query(F.data == CAPTCHA_CANCEL)
+async def handle_captcha_cancel(callback: CallbackQuery) -> None:
+    await auth_manager.resolve_captcha(False)
+    await callback.answer("Остановлено", show_alert=True)
+
+
+@router.callback_query(F.data == "auth:sms_help")
+async def handle_sms_help(callback: CallbackQuery) -> None:
+    await callback.answer("Отправьте SMS-код ответом на сообщение в чате", show_alert=True)
+
+
+@router.callback_query(F.data == CAPTCHA_MANUAL)
+async def handle_captcha_manual(callback: CallbackQuery) -> None:
+    await auth_manager.request_manual_captcha()
+    await callback.answer("Переключаюсь в ручной режим", show_alert=True)
+
+
+def _collect_error_snippet(log_path: str) -> str:
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return "Лог-файл не найден"
+
+    if not lines:
+        return "Лог пуст"
+
+    error_indices = [
+        idx for idx, line in enumerate(lines) if "ERROR" in line or "Traceback" in line
+    ]
+    if error_indices:
+        idx = error_indices[-1]
+        start = max(0, idx - 10)
+        end = min(len(lines), idx + 20)
+    else:
+        start = max(0, len(lines) - 50)
+        end = len(lines)
+
+    snippet = "".join(lines[start:end]).strip()
+    return snippet or "Лог пуст"
+
+
+async def build_failure_report() -> str:
+    parts: List[str] = []
+    parts.append(f"Snapshot: {datetime.utcnow().isoformat()}Z")
+
+    auth_state = await run_in_thread(db.settings_get, "auth_state", "")
+    auth_exp = await run_in_thread(db.settings_get, "auth_exp", "")
+    system_state = await run_in_thread(db.settings_get, "auth_system_state", "")
+    system_hint = await run_in_thread(db.settings_get, "auth_system_hint", "")
+    sms_pending = await run_in_thread(db.settings_get, "auth_sms_pending", "0")
+
+    parts.append(f"Auth state: {auth_state or '—'}")
+    if auth_exp:
+        parts.append(f"Auth valid until: {auth_exp}")
+    if system_state:
+        line = f"System check: {system_state}"
+        if system_hint:
+            line += f" ({system_hint})"
+        parts.append(line)
+    if sms_pending == "1":
+        parts.append("SMS pending: yes")
+
+    portal_state = await run_in_thread(db.settings_get, "portal_state", "")
+    portal_error = await run_in_thread(db.settings_get, "portal_error", "")
+    portal_code = await run_in_thread(db.settings_get, "portal_code", "")
+    portal_latency = await run_in_thread(db.settings_get, "portal_latency_ms", "")
+    vpn_state = await run_in_thread(db.settings_get, "vpn_state", "")
+    vpn_error = await run_in_thread(db.settings_get, "vpn_error", "")
+
+    parts.append(
+        f"Portal: {portal_state or '—'} (HTTP {portal_code or '—'}, {portal_latency or '—'} ms)"
     )
     await _append_event("Проверен VPN-туннель — соединение стабильно")
     await callback.message.answer(text)
@@ -648,12 +874,9 @@ async def handle_vpn_status(callback: CallbackQuery) -> None:
 @router.message(F.text)
 async def handle_text(message: Message) -> None:
     action = PENDING_ACTIONS.pop(message.from_user.id, None)
-    text_raw = (message.text or "").strip()
     if not action:
-        if text_raw.lower().startswith("/start"):
-            await _send_dashboard(message.bot, message.chat.id)
         return
-    text = text_raw
+    text = (message.text or "").strip()
     if "|" in text:
         maybe_title, maybe_url = [part.strip() for part in text.split("|", 1)]
     else:
