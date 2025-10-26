@@ -254,9 +254,6 @@ class AuthManager:
         try:
             await page.goto(self._login_url, wait_until="domcontentloaded", timeout=30000)
             await self.handle_portal_interstitial(page)
-            if await self._is_identity_wizard(page):
-                logger.debug("Preflight detected identity wizard, treating as NEED_AUTH")
-                return "NEED_AUTH"
             if await page.locator("form[id*='login']").count() > 0:
                 return "NEED_AUTH"
             if await page.locator("input[type='password']").count() > 0:
@@ -285,14 +282,12 @@ class AuthManager:
             await page.goto(self._login_url, wait_until="domcontentloaded", timeout=45000)
             await self._accept_cookies(page)
             await self.handle_portal_interstitial(page)
-            await self._advance_identity_wizard(page)
 
             if await self._handle_recaptcha(page, bot, manual=manual) is False:
                 return "NEED_CAPTCHA"
 
             await self._submit_credentials(page)
             await self.handle_portal_interstitial(page)
-            await self._advance_identity_wizard(page)
 
             sms_needed = await self._await_sms_prompt(page)
             if sms_needed:
@@ -304,7 +299,6 @@ class AuthManager:
 
             await page.wait_for_load_state("networkidle")
             await self.handle_portal_interstitial(page)
-            await self._advance_identity_wizard(page)
             state = await self._preflight(context)
             if state == "OK":
                 await self.capture_page_screenshot(
