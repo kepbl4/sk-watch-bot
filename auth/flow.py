@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -174,21 +175,79 @@ class AuthManager:
             return self._context
 
         os.makedirs(self._profile_dir, exist_ok=True)
+        install_attempted = False
+        while True:
+            try:
+                if not self._playwright:
+                    self._playwright = await async_playwright().start()
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    self._profile_dir,
+                    headless=self._headless,
+                    timezone_id=self._timezone,
+                    locale="sk-SK",
+                    accept_downloads=False,
+                    ignore_https_errors=self._ignore_https,
+                    args=["--lang=sk-SK,sk;q=0.9,en;q=0.8"],
+                )
+                return self._context
+            except Exception as exc:  # pragma: no cover - defensive
+                if not install_attempted and self._should_install_browser(exc):
+                    install_attempted = True
+                    logger.warning("Playwright browser missing, attempting installation…")
+                    success = await self._install_playwright_browsers()
+                    await self._shutdown_browser()
+                    if success:
+                        logger.info("Playwright browser installation finished successfully")
+                        continue
+                    logger.error("Playwright browser installation failed")
+                    return None
+                logger.exception("Failed to launch browser: %s", exc)
+                await self._shutdown_browser()
+                return None
+
+    def _should_install_browser(self, exc: Exception) -> bool:
+        message = str(exc)
+        return "Executable doesn't exist" in message or "was just installed" in message
+
+    async def _shutdown_browser(self) -> None:
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception as close_exc:  # pragma: no cover - defensive cleanup
+                logger.debug("Failed to close browser context: %s", close_exc)
+            self._context = None
+        if self._playwright:
+            try:
+                result = self._playwright.stop()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as stop_exc:  # pragma: no cover - defensive cleanup
+                logger.debug("Failed to stop Playwright: %s", stop_exc)
+            self._playwright = None
+
+    async def _install_playwright_browsers(self) -> bool:
+        command = [sys.executable, "-m", "playwright", "install", "chromium"]
         try:
-            self._playwright = await async_playwright().start()
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                self._profile_dir,
-                headless=self._headless,
-                timezone_id=self._timezone,
-                locale="sk-SK",
-                accept_downloads=False,
-                ignore_https_errors=self._ignore_https,
-                args=["--lang=sk-SK,sk;q=0.9,en;q=0.8"],
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            return self._context
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("Failed to launch browser: %s", exc)
-            return None
+        except FileNotFoundError as exc:  # pragma: no cover - runtime environment
+            logger.error("playwright install command not found: %s", exc)
+            return False
+
+        stdout, stderr = await proc.communicate()
+        if stdout:
+            logger.debug("playwright install stdout: %s", stdout.decode(errors="ignore").strip())
+        if stderr:
+            logger.debug("playwright install stderr: %s", stderr.decode(errors="ignore").strip())
+
+        if proc.returncode == 0:
+            return True
+
+        logger.error("playwright install exited with code %s", proc.returncode)
+        return False
 
     async def _preflight(self, context: BrowserContext) -> str:
         page = await context.new_page()
