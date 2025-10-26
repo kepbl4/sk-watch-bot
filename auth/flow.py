@@ -54,6 +54,12 @@ class AuthManager:
         self._screen_dir.mkdir(parents=True, exist_ok=True)
         self._manual_session_active = False
 
+    async def handle_portal_interstitial(self, page: Page) -> None:
+        """Dismiss intermediate confirmation screens on the portal."""
+
+        await self._click_continue(page)
+        await self._select_language(page)
+
     async def ensure_auth(self, bot: Bot, *, manual: bool = False, force: bool = False) -> str:
         """Ensure the session is authorised; return state string."""
 
@@ -188,10 +194,18 @@ class AuthManager:
         page = await context.new_page()
         try:
             await page.goto(self._login_url, wait_until="domcontentloaded", timeout=30000)
-            if "login" in page.url.lower():
-                return "NEED_AUTH"
+            await self.handle_portal_interstitial(page)
             if await page.locator("form[id*='login']").count() > 0:
                 return "NEED_AUTH"
+            if await page.locator("input[type='password']").count() > 0:
+                return "NEED_AUTH"
+            if "login" in page.url.lower():
+                return "NEED_AUTH"
+            try:
+                await page.wait_for_selector("text=Pracoviská", timeout=5000)
+                logger.debug("Preflight located schedule marker")
+            except PlaywrightTimeoutError:
+                logger.debug("Preflight did not see schedule marker, assuming session ok")
             return "OK"
         except PlaywrightTimeoutError:
             return "NEED_VPN"
@@ -208,11 +222,13 @@ class AuthManager:
         try:
             await page.goto(self._login_url, wait_until="domcontentloaded", timeout=45000)
             await self._accept_cookies(page)
+            await self.handle_portal_interstitial(page)
 
             if await self._handle_recaptcha(page, bot, manual=manual) is False:
                 return "NEED_CAPTCHA"
 
             await self._submit_credentials(page)
+            await self.handle_portal_interstitial(page)
 
             sms_needed = await self._await_sms_prompt(page)
             if sms_needed:
@@ -220,8 +236,10 @@ class AuthManager:
                 if not code:
                     return "NEED_SMS"
                 await self._enter_sms_code(page, code)
+                await self.handle_portal_interstitial(page)
 
             await page.wait_for_load_state("networkidle")
+            await self.handle_portal_interstitial(page)
             state = await self._preflight(context)
             if state == "OK":
                 await self.capture_page_screenshot(
@@ -600,6 +618,47 @@ class AuthManager:
         query["manual_token"] = timestamp
         new_query = urlencode(query)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+    async def _click_continue(self, page: Page) -> None:
+        selectors = [
+            page.get_by_role("button", name=re.compile("Pokračovať", re.I)),
+            page.get_by_role("button", name=re.compile("Continue", re.I)),
+            page.locator("button:has-text('Pokračovať')"),
+            page.locator("button:has-text('Continue')"),
+        ]
+        for locator in selectors:
+            try:
+                if await locator.count():
+                    await locator.first.click()
+                    await page.wait_for_timeout(300)
+                    logger.info("Confirmed portal continue dialog")
+                    return
+            except Exception as exc:  # pragma: no cover - selector edge cases
+                logger.debug("Continue selector failed: %s", exc)
+
+    async def _select_language(self, page: Page) -> None:
+        language_patterns = [
+            re.compile("Sloven", re.I),
+            re.compile("English", re.I),
+            re.compile("Rus", re.I),
+            re.compile("Укра", re.I),
+        ]
+        for pattern in language_patterns:
+            try:
+                button = page.get_by_role("button", name=pattern)
+                if await button.count():
+                    await button.first.click()
+                    await page.wait_for_timeout(300)
+                    logger.info("Selected portal language via %s", pattern.pattern)
+                    return
+                link = page.get_by_role("link", name=pattern)
+                if await link.count():
+                    await link.first.click()
+                    await page.wait_for_timeout(300)
+                    logger.info("Selected portal language via link %s", pattern.pattern)
+                    return
+            except Exception as exc:  # pragma: no cover - selector edge cases
+                logger.debug("Language selector failed for %s: %s", pattern.pattern, exc)
 
     async def capture_page_screenshot(
         self,
