@@ -425,22 +425,8 @@ class AuthManager:
             logger.debug("Identity wizard detection failed: %s", exc)
         return False
 
-    async def _await_sms_prompt(self, page: Page) -> bool:
-        selectors = [
-            "input[type='tel']",
-            "input[name*='sms']",
-            "input[id*='sms']",
-            "input[name*='otp']",
-            "input[id*='otp']",
-        ]
-        for selector in selectors:
-            try:
-                await page.wait_for_selector(selector, timeout=5000)
-                logger.info("SMS prompt detected via selector %s", selector)
-                return True
-            except PlaywrightTimeoutError:
-                continue
-        return False
+    async def capture_category_screenshot(self, cat_key: str):  # pragma: no cover - compatibility stub
+        return None
 
     async def capture_portal_error(self, url: str, *, description: str = "") -> None:
         logger.debug("Fake portal error capture for %s (%s)", url, description)

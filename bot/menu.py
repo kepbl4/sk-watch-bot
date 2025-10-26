@@ -337,6 +337,10 @@ async def _ensure_auto_event() -> None:
         await _touch_portal_snapshot()
         await _touch_vpn_snapshot()
 
+    lines = [
+        "<b>🤖 SK Watch Bot · Панель мониторинга</b>",
+        "",
+    ]
 
 async def _touch_vpn_snapshot(update_latency: bool = False) -> Dict[str, Any]:
     raw = await run_in_thread(db.settings_get, FAKE_VPN_KEY, None)
@@ -354,6 +358,19 @@ async def _touch_vpn_snapshot(update_latency: bool = False) -> Dict[str, Any]:
     await run_in_thread(db.settings_set, FAKE_VPN_KEY, json.dumps(snapshot, ensure_ascii=False))
     return snapshot
 
+    lines.append(
+        f"🌐 VPN: ✅ {html.escape(vpn_data.get('country', 'SK'))} • IP {vpn_data.get('ip', '—')} "
+        f"• пинг {vpn_data.get('latency', 0)} мс • {_format_relative(vpn_data.get('checked_at'))}"
+    )
+    lines.append(
+        f"🛰 Портал: ✅ HTTP {portal_data.get('http_status', 200)} • {portal_data.get('latency', 0)} мс "
+        f"• {_format_relative(portal_data.get('checked_at'))}"
+    )
+    total_targets = len(categories) + len(cities)
+    lines.append(
+        f"📡 Мониторинг: {total_targets} направлений • обновление каждые {monitor_interval} мин"
+    )
+    lines.append("")
 
 async def _touch_portal_snapshot() -> Dict[str, Any]:
     raw = await run_in_thread(db.settings_get, FAKE_PORTAL_KEY, None)
