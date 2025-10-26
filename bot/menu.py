@@ -36,6 +36,14 @@ TRACKED_ANCHOR = "tracked"
 ADMIN_ANCHOR = "admin"
 DIAGNOSTIC_ANCHOR = "diagnostics"
 
+ANCHOR_KEYS = (
+    SUMMARY_ANCHOR,
+    CATEGORIES_ANCHOR,
+    TRACKED_ANCHOR,
+    ADMIN_ANCHOR,
+    DIAGNOSTIC_ANCHOR,
+)
+
 STATUS_ICONS = {
     None: "⏸",
     "": "⏸",
@@ -77,6 +85,11 @@ def configure(interval: int, owner_id: Optional[int]) -> None:
 
 async def run_in_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+async def _save_anchor_bundle(chat_id: int, message_id: int) -> None:
+    for anchor in ANCHOR_KEYS:
+        await run_in_thread(db.save_anchor, anchor, chat_id, message_id)
 
 
 async def _read_connectivity_snapshot() -> Dict[str, Any]:
@@ -129,6 +142,13 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
     connector = aiohttp.TCPConnector(ssl=False) if ignore_https else None
     latency_threshold = int(os.getenv("PORTAL_SLOW_THRESHOLD_MS", "4000") or 4000)
 
+    expected_countries_raw = os.getenv("VPN_EXPECTED_COUNTRY", "SK")
+    expected_countries = {
+        item.strip().upper()
+        for item in expected_countries_raw.split(",")
+        if item.strip()
+    }
+
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         # VPN / geo check
         try:
@@ -140,7 +160,12 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                     data = await resp.json()
                     vpn_country = (data.get("country_iso") or data.get("country_iso_code") or "").upper()
                     vpn_ip = data.get("ip") or ""
-                    vpn_state = "OK" if vpn_country == "SK" else "NEED_VPN"
+                    if expected_countries and vpn_country not in expected_countries:
+                        vpn_state = "NEED_VPN"
+                        if not vpn_error:
+                            vpn_error = f"expected {','.join(sorted(expected_countries))} got {vpn_country or '??'}"
+                    else:
+                        vpn_state = "OK"
                 else:
                     vpn_state = "ERR"
                     vpn_error = f"HTTP {resp.status}"
@@ -176,7 +201,6 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                     portal_state = "OK"
                     method_note = "method not allowed"
                 elif status_code in {200, 301, 302}:
-                if status_code in {200, 301, 302}:
                     portal_state = "OK"
                     if elapsed > latency_threshold:
                         portal_state = "SLOW"
@@ -191,7 +215,6 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                     latency_ms=elapsed,
                     http_status=status_code,
                     error=portal_error or method_note,
-                    error=portal_error,
                 )
                 if portal_state == "ERR":
                     logger.warning("Portal sensor error: %s", portal_error)
@@ -200,7 +223,6 @@ async def ensure_connectivity_status(force: bool = False) -> Dict[str, Any]:
                 )
                 if method_note and not portal_error:
                     portal_error = method_note
-                    )
             except Exception as exc:  # pragma: no cover - network issues
                 portal_state = "ERR"
                 portal_error = str(exc)
@@ -413,41 +435,22 @@ def summary_keyboard(*, sms_pending: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-async def ensure_summary_message(message: Message, *, force_status: bool = False) -> None:
+async def _render_summary(
+    bot,
+    chat_id: int,
+    message_id: int,
+    *,
+    force_status: bool = False,
+    fallback_chat_id: Optional[int] = None,
+) -> None:
     text, sms_pending = await build_summary_text(force_status=force_status)
     keyboard = summary_keyboard(sms_pending=sms_pending)
-    anchor = await run_in_thread(db.get_anchor, SUMMARY_ANCHOR)
-    bot = message.bot
-
-    if anchor and anchor.get("chat_id") == message.chat.id:
-        try:
-            await bot.edit_message_text(
-                text=text,
-                chat_id=anchor["chat_id"],
-                message_id=anchor["message_id"],
-                reply_markup=keyboard,
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        except TelegramBadRequest as exc:
-            logger.warning("Failed to edit summary message: %s", exc)
-
-    sent = await message.answer(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-    await run_in_thread(db.save_anchor, SUMMARY_ANCHOR, message.chat.id, sent.message_id)
-    await run_in_thread(db.save_anchor, CATEGORIES_ANCHOR, message.chat.id, sent.message_id)
-    await run_in_thread(db.save_anchor, TRACKED_ANCHOR, message.chat.id, sent.message_id)
-    await run_in_thread(db.save_anchor, ADMIN_ANCHOR, message.chat.id, sent.message_id)
-    await run_in_thread(db.save_anchor, DIAGNOSTIC_ANCHOR, message.chat.id, sent.message_id)
-
-
-async def edit_summary_message(bot, chat_id: int, message_id: int, *, force_status: bool = False) -> None:
-    text, sms_pending = await build_summary_text(force_status=force_status)
     try:
         await bot.edit_message_text(
             text=text,
             chat_id=chat_id,
             message_id=message_id,
-            reply_markup=summary_keyboard(sms_pending=sms_pending),
+            reply_markup=keyboard,
             parse_mode=ParseMode.HTML,
         )
     except TelegramBadRequest as exc:
@@ -735,25 +738,6 @@ async def build_admin_view() -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text="Логи (100)", callback_data="admin:logs:100"),
         ]
     )
-    if screenshots:
-        for shot in screenshots:
-            created = _format_datetime(shot.get("created_at"), "%d.%m %H:%M:%S")
-            keyboard_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"{created} • {shot.get('name')}",
-                        callback_data=f"admin:screen:{shot.get('name')}",
-                    )
-                ]
-            )
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Последние скрины",
-                    callback_data="admin:screenshots",
-                )
-            ]
-        )
     keyboard_rows.append(
         [InlineKeyboardButton(text="Отчёт об ошибке", callback_data="admin:failure_report")]
     )
@@ -789,7 +773,13 @@ async def _edit_message(callback: CallbackQuery, text: str, keyboard: InlineKeyb
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
-    await ensure_summary_message(message)
+    try:
+        await ensure_summary_message(message)
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        logger.exception("Failed to render summary on /start: %s", exc)
+        await message.answer(
+            "Не удалось подготовить сводку. Попробуйте ещё раз позже или обратитесь к администратору."
+        )
 
 
 @router.callback_query(F.data == "summary:refresh")
@@ -921,7 +911,18 @@ async def handle_resume_all(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "summary:vpn")
 async def handle_vpn_status(callback: CallbackQuery) -> None:
-    snapshot = await ensure_connectivity_status(force=True)
+    await callback.answer("Обновляю диагностику…")
+    try:
+        snapshot = await asyncio.wait_for(
+            ensure_connectivity_status(force=True), timeout=6
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Connectivity refresh timed out, using cached snapshot")
+        snapshot = await ensure_connectivity_status(force=False)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.exception("Connectivity refresh failed: %s", exc)
+        snapshot = await _read_connectivity_snapshot()
+
     vpn_line = snapshot.get("vpn_status") or "ERR"
     ip = snapshot.get("vpn_ip") or "—"
     country = snapshot.get("vpn_country_code") or "??"
@@ -930,15 +931,17 @@ async def handle_vpn_status(callback: CallbackQuery) -> None:
     portal_latency = snapshot.get("portal_latency_ms") or "—"
     portal_error = snapshot.get("portal_error") or ""
     lines = [
+        "<b>VPN диагностика</b>",
         f"IP: {ip}",
         f"Страна: {country}",
         f"VPN: {vpn_line} (lat {latency} мс)",
         f"Портал: {portal} (lat {portal_latency} мс)",
     ]
-    if portal_error and portal != "OK":
-        lines.append(portal_error[:60])
-    await refresh_summary(callback.message.bot, force_status=True)
-    await callback.answer("\n".join(lines), show_alert=True)
+    if portal_error and portal.startswith("ERR"):
+        lines.append(f"Ошибка: {portal_error[:120]}")
+
+    await callback.message.answer("\n".join(lines))
+    await refresh_summary(callback.message.bot)
 
 
 @router.callback_query(F.data == CAPTCHA_READY)

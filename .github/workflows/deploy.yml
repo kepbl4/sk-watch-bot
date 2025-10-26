@@ -19,13 +19,13 @@ jobs:
 
       - name: Ensure server baseline
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'SSH'
             set -e
             apt-get update && apt-get -y install python3-venv python3-pip rsync sqlite3
             id bot 2>/dev/null || useradd -r -m -d /opt/bot -s /usr/sbin/nologin bot
             mkdir -p /opt/bot/{run,data,logs,backups,browser_profile,src}
             chown -R bot:bot /opt/bot
-          '
+          SSH
 
       - name: Rsync sources
         run: |
@@ -36,7 +36,7 @@ jobs:
 
       - name: Install deps + Playwright
         run: |
-          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'SSH'
             set -e
             cd /opt/bot
             chown -R bot:bot /opt/bot/src
@@ -44,109 +44,109 @@ jobs:
             sudo -u bot /opt/bot/.venv/bin/pip install --upgrade pip wheel
             sudo -u bot /opt/bot/.venv/bin/pip install -r /opt/bot/src/requirements.txt
             sudo -u bot /opt/bot/.venv/bin/python -m playwright install --with-deps chromium
-          '
+          SSH
 
       - name: Write .env from secret
         run: |
-          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'REMOTE'
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'SSH'
             set -e
             printf '%s' "${{ secrets.ENV_B64 }}" | base64 -d > /opt/bot/.env
             chmod 600 /opt/bot/.env
             chown bot:bot /opt/bot/.env
-REMOTE
+          SSH
 
       - name: Create/Update systemd unit
         run: |
-          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'REMOTE'
-            cat <<'UNIT' > /etc/systemd/system/bot.service
-[Unit]
-Description=SK Watch Bot
-After=network-online.target
-Wants=network-online.target
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'SSH'
+            cat <<'UNIT' | sed 's/^ *//' > /etc/systemd/system/bot.service
+              [Unit]
+              Description=SK Watch Bot
+              After=network-online.target
+              Wants=network-online.target
 
-[Service]
-Type=simple
-User=bot
-Group=bot
-WorkingDirectory=/opt/bot/src
-EnvironmentFile=/opt/bot/.env
-ExecStart=/opt/bot/.venv/bin/python /opt/bot/src/app.py
-Restart=always
-RestartSec=3
-StartLimitIntervalSec=0
-ReadWritePaths=/opt/bot
-NoNewPrivileges=yes
-LimitNOFILE=65535
+              [Service]
+              Type=simple
+              User=bot
+              Group=bot
+              WorkingDirectory=/opt/bot/src
+              EnvironmentFile=/opt/bot/.env
+              ExecStart=/opt/bot/.venv/bin/python /opt/bot/src/app.py
+              Restart=always
+              RestartSec=3
+              StartLimitIntervalSec=0
+              ReadWritePaths=/opt/bot
+              NoNewPrivileges=yes
+              LimitNOFILE=65535
 
-[Install]
-WantedBy=multi-user.target
-UNIT
+              [Install]
+              WantedBy=multi-user.target
+            UNIT
             systemctl daemon-reload
             systemctl enable bot || true
             systemctl restart bot
             systemctl --no-pager --lines=40 status bot
-REMOTE
+          SSH
 
       - name: Ensure maintenance timers
         run: |
-          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'REMOTE'
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'SSH'
             set -e
-            cat <<'UNIT' > /etc/systemd/system/bot-health.service
-[Unit]
-Description=SK Watch Bot health check
-After=network-online.target
+            cat <<'UNIT' | sed 's/^ *//' > /etc/systemd/system/bot-health.service
+              [Unit]
+              Description=SK Watch Bot health check
+              After=network-online.target
 
-[Service]
-Type=oneshot
-User=bot
-Group=bot
-WorkingDirectory=/opt/bot/src
-EnvironmentFile=/opt/bot/.env
-ExecStart=/opt/bot/.venv/bin/python /opt/bot/src/scripts/smoke-check --quiet
-UNIT
-            cat <<'UNIT' > /etc/systemd/system/bot-health.timer
-[Unit]
-Description=Run SK Watch Bot health check every 2 minutes
+              [Service]
+              Type=oneshot
+              User=bot
+              Group=bot
+              WorkingDirectory=/opt/bot/src
+              EnvironmentFile=/opt/bot/.env
+              ExecStart=/opt/bot/.venv/bin/python /opt/bot/src/scripts/smoke-check --quiet
+            UNIT
+            cat <<'UNIT' | sed 's/^ *//' > /etc/systemd/system/bot-health.timer
+              [Unit]
+              Description=Run SK Watch Bot health check every 2 minutes
 
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=2min
-AccuracySec=1min
-Unit=bot-health.service
-Persistent=true
+              [Timer]
+              OnBootSec=2min
+              OnUnitActiveSec=2min
+              AccuracySec=1min
+              Unit=bot-health.service
+              Persistent=true
 
-[Install]
-WantedBy=timers.target
-UNIT
-            cat <<'UNIT' > /etc/systemd/system/bot-dump.service
-[Unit]
-Description=SK Watch Bot database backup
-After=network-online.target
+              [Install]
+              WantedBy=timers.target
+            UNIT
+            cat <<'UNIT' | sed 's/^ *//' > /etc/systemd/system/bot-dump.service
+              [Unit]
+              Description=SK Watch Bot database backup
+              After=network-online.target
 
-[Service]
-Type=oneshot
-User=bot
-Group=bot
-WorkingDirectory=/opt/bot
-Environment=DB_PATH=/opt/bot/data/bot.db
-Environment=BACKUP_DIR=/opt/bot/backups
-ExecStart=/bin/bash /opt/bot/src/scripts/backup-db.sh
-UNIT
-            cat <<'UNIT' > /etc/systemd/system/bot-dump.timer
-[Unit]
-Description=Nightly SK Watch Bot database backup
+              [Service]
+              Type=oneshot
+              User=bot
+              Group=bot
+              WorkingDirectory=/opt/bot
+              Environment=DB_PATH=/opt/bot/data/bot.db
+              Environment=BACKUP_DIR=/opt/bot/backups
+              ExecStart=/bin/bash /opt/bot/src/scripts/backup-db.sh
+            UNIT
+            cat <<'UNIT' | sed 's/^ *//' > /etc/systemd/system/bot-dump.timer
+              [Unit]
+              Description=Nightly SK Watch Bot database backup
 
-[Timer]
-OnCalendar=*-*-* 04:10:00
-AccuracySec=1min
-Persistent=true
-Unit=bot-dump.service
+              [Timer]
+              OnCalendar=*-*-* 04:10:00
+              AccuracySec=1min
+              Persistent=true
+              Unit=bot-dump.service
 
-[Install]
-WantedBy=timers.target
-UNIT
+              [Install]
+              WantedBy=timers.target
+            UNIT
             systemctl daemon-reload
             systemctl enable --now bot-health.timer
             systemctl enable --now bot-dump.timer
             systemctl list-timers --all | grep bot- || true
-REMOTE
+          SSH
