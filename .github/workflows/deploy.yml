@@ -19,13 +19,13 @@ jobs:
 
       - name: Ensure server baseline
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'REMOTE'
             set -e
             apt-get update && apt-get -y install python3-venv python3-pip rsync sqlite3
             id bot 2>/dev/null || useradd -r -m -d /opt/bot -s /usr/sbin/nologin bot
             mkdir -p /opt/bot/{run,data,logs,backups,browser_profile,src}
             chown -R bot:bot /opt/bot
-          '
+REMOTE
 
       - name: Rsync sources
         run: |
@@ -36,7 +36,7 @@ jobs:
 
       - name: Install deps + Playwright
         run: |
-          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'REMOTE'
             set -e
             cd /opt/bot
             chown -R bot:bot /opt/bot/src
@@ -44,7 +44,7 @@ jobs:
             sudo -u bot /opt/bot/.venv/bin/pip install --upgrade pip wheel
             sudo -u bot /opt/bot/.venv/bin/pip install -r /opt/bot/src/requirements.txt
             sudo -u bot /opt/bot/.venv/bin/python -m playwright install --with-deps chromium
-          '
+REMOTE
 
       - name: Write .env from secret
         run: |
